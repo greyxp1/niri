@@ -526,6 +526,17 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                     Event::TouchpadToggled { on } => {
                         println!("Touchpad enabled: {on}");
                     }
+                    Event::ZoomChanged {
+                        output,
+                        level,
+                        focal_x,
+                        focal_y,
+                        is_locked,
+                    } => {
+                        println!(
+                            "Zoom on {output}: level={level} focal=({focal_x}, {focal_y}) locked={is_locked}"
+                        );
+                    }
                 }
             }
         }
