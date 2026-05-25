@@ -2473,6 +2473,7 @@ mod tests {
                 increment_type: Linear,
                 pinch_sensitivity: 1.0,
                 max_zoom: 10.0,
+                zoom_filter_threshold: 2.0,
             },
         }
         "#);

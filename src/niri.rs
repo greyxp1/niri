@@ -7676,7 +7676,6 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
     output_geo: Rectangle<i32, Logical>,
     zoom_filter_threshold: f64,
 ) -> OutputRenderElements<R> {
-    // Generate match arms for each OutputRenderElement variant.
     macro_rules! apply_zoom {
         ($($variant:ident),*) => {
             match element {
@@ -7717,7 +7716,7 @@ fn apply_zoom_to_render_element<R: NiriRenderer>(
                             output_geo
                                 .loc
                                 .to_f64()
-                                .to_physical(Scale::from(zoom_factor)),
+                                .to_physical(output_scale),
                             Relocate::Relative,
                         )
                         .with_filter(zoom_filter(zoom_factor, zoom_filter_threshold));
