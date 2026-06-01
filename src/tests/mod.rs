@@ -14,4 +14,3 @@ mod remove_output;
 mod transactions;
 mod virtual_pointer;
 mod window_opening;
-mod zoom;
