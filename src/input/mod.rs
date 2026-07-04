@@ -4483,7 +4483,7 @@ impl State {
             .clone()
             .or_else(|| self.niri.output_under_cursor())
         {
-            let timestamp = Duration::from_millis(event.time_msec() as u64);
+            let timestamp = Duration::from_micros(event.time().micros());
             let scale = event.scale();
             let cursor_global = self.niri.seat.get_pointer().unwrap().current_location();
 
@@ -4841,7 +4841,7 @@ impl State {
         let slot = evt.slot();
 
         self.niri.touch_points.insert(i32::from(slot), pos);
-        self.handle_touch_pinch(Duration::from_millis(evt.time_msec() as u64));
+        self.handle_touch_pinch(Duration::from_micros(evt.time().micros()));
 
         let serial = SERIAL_COUNTER.next_serial();
 
@@ -4976,7 +4976,7 @@ impl State {
         let slot = evt.slot();
 
         self.niri.touch_points.remove(&i32::from(slot));
-        self.handle_touch_pinch(Duration::from_millis(evt.time_msec() as u64));
+        self.handle_touch_pinch(Duration::from_micros(evt.time().micros()));
 
         if let Some(capture) = self.niri.screenshot_ui.pointer_up(Some(slot)) {
             if capture {
@@ -5007,7 +5007,7 @@ impl State {
         let slot = evt.slot();
 
         self.niri.touch_points.insert(i32::from(slot), pos);
-        self.handle_touch_pinch(Duration::from_millis(evt.time_msec() as u64));
+        self.handle_touch_pinch(Duration::from_micros(evt.time().micros()));
 
         if let Some(output) = self.niri.screenshot_ui.selection_output().cloned() {
             self.update_screenshot_ui_touch(pos, slot);
