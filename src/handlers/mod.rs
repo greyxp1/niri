@@ -217,6 +217,16 @@ impl PointerConstraintsHandler for State {
             return;
         };
 
+        // If the constraint was broken by the pointer forcibly leaving the surface (e.g. the user
+        // opened the overview), then it doesn't make much sense to warp it.
+        //
+        // Furthermore, when the constraint is removed as part of the pointer leaving the surface,
+        // this call happens with locked pointer data, and calling set_location() will try to lock
+        // it again and deadlock.
+        if pointer.last_enter().is_none() {
+            return;
+        }
+
         pointer.set_location(target);
 
         // Redraw to update the cursor position if it's visible.
