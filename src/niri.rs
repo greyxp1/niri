@@ -6250,6 +6250,11 @@ impl Niri {
             return;
         }
 
+        if lock != surface.ext_session_lock() {
+            debug!("ignoring lock surface from an unrelated lock instance");
+            return;
+        }
+
         let Some(output_state) = self.output_state.get_mut(output) else {
             error!("missing output state");
             return;
