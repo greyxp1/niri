@@ -139,7 +139,7 @@ use crate::handlers::image_copy_capture::{
 use crate::handlers::{configure_lock_surface, XDG_ACTIVATION_TOKEN_TIMEOUT};
 use crate::input::pick_color_grab::PickColorGrab;
 use crate::input::scroll_swipe_gesture::ScrollSwipeGesture;
-use crate::input::scroll_tracker::ScrollTracker;
+use crate::input::scroll_tracker::{ScrollTracker, WheelAcceleration};
 use crate::input::{
     apply_libinput_settings, mods_with_finger_scroll_binds, mods_with_mouse_binds,
     mods_with_tablet_stylus_binds, mods_with_wheel_binds, TabletData,
@@ -415,6 +415,7 @@ pub struct Niri {
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
+    pub zoom_wheel_acceleration: WheelAcceleration,
     pub mods_with_mouse_binds: HashSet<Modifiers>,
     pub mods_with_wheel_binds: HashSet<Modifiers>,
     pub mods_with_tablet_stylus_binds: HashSet<Modifiers>,
@@ -2930,6 +2931,7 @@ impl Niri {
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
+            zoom_wheel_acceleration: WheelAcceleration::default(),
             mods_with_mouse_binds,
             mods_with_wheel_binds,
             mods_with_tablet_stylus_binds,

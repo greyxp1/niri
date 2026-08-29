@@ -2451,7 +2451,7 @@ impl State {
                         return;
                     }
 
-                    let current_level = self.niri.layout.zoom_level_for_output(&output);
+                    let current_level = self.niri.layout.zoom_target_level_for_output(&output);
                     let max_zoom = self.niri.layout.zoom_max_for_output(&output);
                     let increment_type = self.niri.config.borrow().zoom.increment_type;
                     let target_level = match level {
@@ -3447,15 +3447,26 @@ impl State {
                         (bind_up, bind_down)
                     };
 
-                    if let Some(down) = bind_down {
-                        for _ in 0..ticks {
-                            self.handle_bind(down.clone());
+                    let bind = if ticks > 0 { bind_down } else { bind_up };
+                    if let Some(mut bind) = bind {
+                        if let Action::SetZoomLevel(ZoomLevelChange::Adjust(delta), _) =
+                            &mut bind.action
+                        {
+                            let steps = self.niri.zoom_wheel_acceleration.apply(
+                                timestamp,
+                                ticks,
+                                modifiers.bits(),
+                            );
+                            *delta *= steps.abs();
+                            self.handle_bind(bind);
+                        } else {
+                            self.niri.zoom_wheel_acceleration.reset();
+                            for _ in 0..ticks.abs() {
+                                self.handle_bind(bind.clone());
+                            }
                         }
-                    }
-                    if let Some(up) = bind_up {
-                        for _ in ticks..0 {
-                            self.handle_bind(up.clone());
-                        }
+                    } else {
+                        self.niri.zoom_wheel_acceleration.reset();
                     }
                 }
 
@@ -3463,6 +3474,7 @@ impl State {
             } else {
                 self.niri.horizontal_wheel_tracker.reset();
                 self.niri.vertical_wheel_tracker.reset();
+                self.niri.zoom_wheel_acceleration.reset();
             }
         }
 
