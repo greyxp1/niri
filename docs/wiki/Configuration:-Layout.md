@@ -10,6 +10,7 @@ layout {
     center-focused-column "never"
     always-center-single-column
     fill-empty-space
+    maximize-single-window-to-edges
     empty-workspace-above-first
     default-column-display "tabbed"
     background-color "#003300"
@@ -152,6 +153,18 @@ Note that the `center-focused-column "always"` option takes precedence.
 ```kdl
 layout {
     fill-empty-space
+}
+```
+
+### `maximize-single-window-to-edges`
+
+If set, niri will maximize a tiled window to the workspace edges when it is the only tiled window
+on its workspace. It will return to its previous size when another tiled window opens, then maximize
+again if it becomes the only tiled window. Floating windows are ignored.
+
+```kdl
+layout {
+    maximize-single-window-to-edges
 }
 ```
 
