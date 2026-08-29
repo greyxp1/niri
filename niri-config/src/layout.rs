@@ -19,6 +19,7 @@ pub struct Layout {
     pub preset_window_heights: Vec<PresetSize>,
     pub center_focused_column: CenterFocusedColumn,
     pub always_center_single_column: bool,
+    pub maximize_single_window_to_edges: bool,
     pub empty_workspace_above_first: bool,
     pub default_column_display: ColumnDisplay,
     pub gaps: f64,
@@ -42,6 +43,7 @@ impl Default for Layout {
             default_column_width: Some(PresetSize::Proportion(0.5)),
             center_focused_column: CenterFocusedColumn::Never,
             always_center_single_column: false,
+            maximize_single_window_to_edges: false,
             empty_workspace_above_first: false,
             default_column_display: ColumnDisplay::Normal,
             gaps: 16.,
@@ -66,6 +68,7 @@ impl MergeWith<LayoutPart> for Layout {
             tab_indicator,
             insert_hint,
             always_center_single_column,
+            maximize_single_window_to_edges,
             empty_workspace_above_first,
             gaps,
         );
@@ -116,6 +119,8 @@ pub struct LayoutPart {
     pub center_focused_column: Option<CenterFocusedColumn>,
     #[knuffel(child)]
     pub always_center_single_column: Option<Flag>,
+    #[knuffel(child)]
+    pub maximize_single_window_to_edges: Option<Flag>,
     #[knuffel(child)]
     pub empty_workspace_above_first: Option<Flag>,
     #[knuffel(child, unwrap(argument, str))]
