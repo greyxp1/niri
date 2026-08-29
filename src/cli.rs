@@ -124,6 +124,8 @@ pub enum Msg {
     OverviewState,
     /// List screencasts.
     Casts,
+    /// List zoom state of outputs.
+    ZoomState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
