@@ -103,6 +103,14 @@ impl OutputZoomState {
         self.snapshot_at(now).level > 1.0
     }
 
+    pub fn target_level(&self) -> f64 {
+        match &self.level_transition {
+            ZoomLevelTransition::Animating(a) => a.target_level(),
+            ZoomLevelTransition::Gesturing(g) => g.current_level,
+            ZoomLevelTransition::Idle => self.level,
+        }
+    }
+
     /// Update cursor position on active transitions for focal tracking.
     pub fn set_cursor_pos(&mut self, pos: Point<f64, Logical>) {
         match &mut self.level_transition {
@@ -300,6 +308,10 @@ impl ZoomLevelAnimation {
 
     pub fn sample_time(&self) -> Duration {
         self.anim.clock_now()
+    }
+
+    pub fn target_level(&self) -> f64 {
+        self.anim.to()
     }
 }
 

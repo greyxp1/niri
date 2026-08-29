@@ -2883,6 +2883,11 @@ impl<W: LayoutElement> Layout<W> {
         self.zoom_snapshot_for_output(output).level
     }
 
+    pub fn zoom_target_level_for_output(&self, output: &Output) -> f64 {
+        self.zoom_state_ref(output)
+            .map_or(1.0, OutputZoomState::target_level)
+    }
+
     pub fn zoom_max_for_output(&self, output: &Output) -> f64 {
         self.monitor_for_output(output)
             .map_or(self.options.zoom.max_zoom, |mon| mon.options.zoom.max_zoom)
