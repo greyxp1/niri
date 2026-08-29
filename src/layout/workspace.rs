@@ -110,6 +110,9 @@ pub struct Workspace<W: LayoutElement> {
     /// Layout config overrides for this workspace.
     layout_config: Option<niri_config::LayoutPart>,
 
+    /// Window currently maximized by `maximize-single-window-to-edges`.
+    auto_maximized_window: Option<W::Id>,
+
     /// Unique ID of this workspace.
     id: WorkspaceId,
 }
@@ -271,6 +274,7 @@ impl<W: LayoutElement> Workspace<W> {
             options,
             name: config.map(|c| c.name.0),
             layout_config,
+            auto_maximized_window: None,
             id: WorkspaceId::next(),
         }
     }
@@ -335,6 +339,7 @@ impl<W: LayoutElement> Workspace<W> {
             options,
             name: config.map(|c| c.name.0),
             layout_config,
+            auto_maximized_window: None,
             id: WorkspaceId::next(),
         }
     }
@@ -429,6 +434,7 @@ impl<W: LayoutElement> Workspace<W> {
 
         self.base_options = base_options;
         self.options = options;
+        self.update_single_window_maximized();
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) {
@@ -604,6 +610,62 @@ impl<W: LayoutElement> Workspace<W> {
         )
     }
 
+    fn clear_auto_maximized_window(&mut self, window: &W::Id) {
+        if self.auto_maximized_window.as_ref() != Some(window) {
+            return;
+        }
+
+        let window = self.auto_maximized_window.take().unwrap();
+        if self
+            .scrolling
+            .tiles()
+            .any(|tile| tile.window().id() == &window)
+        {
+            self.set_maximized(&window, false);
+        }
+    }
+
+    fn update_single_window_maximized(&mut self) {
+        let only_window = self
+            .options
+            .layout
+            .maximize_single_window_to_edges
+            .then(|| {
+                let mut windows = self
+                    .scrolling
+                    .tiles()
+                    .map(|tile| tile.window().id().clone());
+                let first = windows.next();
+                first.filter(|_| windows.next().is_none())
+            })
+            .flatten();
+
+        if self.auto_maximized_window == only_window {
+            return;
+        }
+
+        if let Some(window) = self.auto_maximized_window.clone() {
+            self.clear_auto_maximized_window(&window);
+        }
+
+        let Some(window) = only_window else {
+            return;
+        };
+        let is_normal = self
+            .scrolling
+            .tiles()
+            .find(|tile| tile.window().id() == &window)
+            .unwrap()
+            .window()
+            .pending_sizing_mode()
+            .is_normal();
+
+        if is_normal {
+            self.set_maximized(&window, true);
+            self.auto_maximized_window = Some(window);
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn add_tile(
         &mut self,
@@ -704,6 +766,8 @@ impl<W: LayoutElement> Workspace<W> {
                 }
             }
         }
+
+        self.update_single_window_maximized();
     }
 
     pub fn add_tile_to_column(
@@ -720,6 +784,8 @@ impl<W: LayoutElement> Workspace<W> {
         if activate {
             self.floating_is_active = FloatingActive::No;
         }
+
+        self.update_single_window_maximized();
     }
 
     pub fn add_column(
@@ -737,6 +803,8 @@ impl<W: LayoutElement> Workspace<W> {
         if activate {
             self.floating_is_active = FloatingActive::No;
         }
+
+        self.update_single_window_maximized();
     }
 
     fn update_focus_floating_tiling_after_removing(&mut self, removed_from_floating: bool) {
@@ -753,6 +821,8 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn remove_tile(&mut self, id: &W::Id, transaction: Transaction) -> RemovedTile<W> {
+        self.clear_auto_maximized_window(id);
+
         let mut from_floating = false;
         let removed = if self.floating.has_window(id) {
             from_floating = true;
@@ -766,6 +836,7 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.update_focus_floating_tiling_after_removing(from_floating);
+        self.update_single_window_maximized();
 
         removed
     }
@@ -774,6 +845,10 @@ impl<W: LayoutElement> Workspace<W> {
         let from_floating = self.floating_is_active.get();
         if from_floating {
             return None;
+        }
+
+        if let Some(window) = self.auto_maximized_window.clone() {
+            self.clear_auto_maximized_window(&window);
         }
 
         let column = self.scrolling.remove_active_column()?;
@@ -785,6 +860,7 @@ impl<W: LayoutElement> Workspace<W> {
         }
 
         self.update_focus_floating_tiling_after_removing(from_floating);
+        self.update_single_window_maximized();
 
         Some(column)
     }
@@ -1323,6 +1399,10 @@ impl<W: LayoutElement> Workspace<W> {
     }
 
     pub fn set_maximized(&mut self, window: &W::Id, maximize: bool) {
+        if self.auto_maximized_window.as_ref() == Some(window) {
+            self.auto_maximized_window = None;
+        }
+
         let mut restore_to_floating = false;
         if self.floating.has_window(window) {
             if maximize {
@@ -1394,6 +1474,8 @@ impl<W: LayoutElement> Workspace<W> {
             return;
         };
 
+        self.clear_auto_maximized_window(&id);
+
         let (_, render_pos, _) = self
             .tiles_with_render_positions()
             .find(|(tile, _, _)| *tile.window().id() == id)
@@ -1445,6 +1527,7 @@ impl<W: LayoutElement> Workspace<W> {
             .unwrap();
 
         tile.animate_move_from(render_pos - new_render_pos);
+        self.update_single_window_maximized();
     }
 
     pub fn set_window_floating(&mut self, id: Option<&W::Id>, floating: bool) {
