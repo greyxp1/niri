@@ -129,6 +129,8 @@ pub enum Msg {
     Casts,
     /// Send a raw JSON request to the compositor, reading from stdin.
     RawRequest,
+    /// List zoom state of outputs.
+    ZoomState,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
