@@ -52,6 +52,9 @@ pub struct EventStreamState {
 
     /// State of touchpads.
     pub touchpad: TouchpadState,
+
+    /// State of zoom.
+    pub zoom: ZoomChangedState,
 }
 
 /// The workspaces state communicated over the event stream.
@@ -108,6 +111,30 @@ pub struct TouchpadState {
     pub on: bool,
 }
 
+/// Zoom state for a single output tracked in the event stream.
+#[derive(Debug, Clone)]
+pub struct ZoomOutputState {
+    /// Current zoom level.
+    pub level: f64,
+    /// Focal point X coordinate within the output.
+    pub focal_x: f64,
+    /// Focal point Y coordinate within the output.
+    pub focal_y: f64,
+    /// Whether zoom focal point is locked.
+    pub is_locked: bool,
+}
+
+/// The zoom state communicated over the event stream.
+#[derive(Debug, Default)]
+pub struct ZoomChangedState {
+    /// Map from output name to zoom state.
+    pub outputs: HashMap<String, ZoomOutputState>,
+    /// Previous snapshot `transitioning` flag per output (transient, not IPC).
+    pub was_transitioning: HashMap<String, bool>,
+    /// Previous snapshot `is_gesture` flag per output (transient, not IPC).
+    pub was_gesturing: HashMap<String, bool>,
+}
+
 impl EventStreamStatePart for EventStreamState {
     fn replicate(&self) -> Vec<Event> {
         let mut events = Vec::new();
@@ -118,6 +145,7 @@ impl EventStreamStatePart for EventStreamState {
         events.extend(self.config.replicate());
         events.extend(self.casts.replicate());
         events.extend(self.touchpad.replicate());
+        events.extend(self.zoom.replicate());
         events
     }
 
@@ -129,6 +157,7 @@ impl EventStreamStatePart for EventStreamState {
         let event = self.config.apply(event)?;
         let event = self.casts.apply(event)?;
         let event = self.touchpad.apply(event)?;
+        let event = self.zoom.apply(event)?;
         Some(event)
     }
 }
@@ -348,6 +377,45 @@ impl EventStreamStatePart for TouchpadState {
         match event {
             Event::TouchpadToggled { on } => {
                 self.on = on;
+            }
+            event => return Some(event),
+        }
+        None
+    }
+}
+
+impl EventStreamStatePart for ZoomChangedState {
+    fn replicate(&self) -> Vec<Event> {
+        self.outputs
+            .iter()
+            .map(|(output, state)| Event::ZoomChanged {
+                output: output.clone(),
+                level: state.level,
+                focal_x: state.focal_x,
+                focal_y: state.focal_y,
+                is_locked: state.is_locked,
+            })
+            .collect()
+    }
+
+    fn apply(&mut self, event: Event) -> Option<Event> {
+        match event {
+            Event::ZoomChanged {
+                output,
+                level,
+                focal_x,
+                focal_y,
+                is_locked,
+            } => {
+                self.outputs.insert(
+                    output,
+                    ZoomOutputState {
+                        level,
+                        focal_x,
+                        focal_y,
+                        is_locked,
+                    },
+                );
             }
             event => return Some(event),
         }
