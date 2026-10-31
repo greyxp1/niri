@@ -1,0 +1,61 @@
+name: Cache Niri
+
+on:
+  push:
+    branches: [personal]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-niri
+  cancel-in-progress: true
+
+jobs:
+  cache:
+    if: github.repository == 'greyxp1/niri'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: personal
+          path: niri
+          fetch-depth: 0
+
+      - uses: actions/checkout@v6
+        with:
+          repository: greyxp1/nixconf
+          ref: main
+          path: nixconf
+          fetch-depth: 0
+
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - uses: cachix/install-nix-action@v31
+        with:
+          github_access_token: '${{ secrets.GITHUB_TOKEN }}'
+
+      - uses: cachix/cachix-action@v17
+        with:
+          name: grey-nixconf
+          authToken: '${{ secrets.CACHIX_AUTH_TOKEN }}'
+
+      - name: Build the system's Niri package
+        run: |
+          nix build --impure --print-build-logs --cores 2 --max-jobs 1 --expr '
+            let
+              workspace = builtins.getEnv "GITHUB_WORKSPACE";
+              niri = builtins.getFlake ("git+file://" + workspace + "/niri");
+              nixconf = builtins.getFlake ("git+file://" + workspace + "/nixconf");
+              outputs = (import (nixconf.outPath + "/flake.nix")).outputs {
+                self = nixconf;
+                tackOverrides = { inherit niri; };
+              };
+            in outputs.nixosConfigurations.desktop.config.programs.niri.package
+          '
