@@ -158,6 +158,7 @@ install -Dm644 -t %{buildroot}%{zsh_completions_dir} ./_niri
 %doc docs/wiki
 %{_bindir}/niri
 %{_bindir}/niri-session
+%{_bindir}/niri-spawn-v1
 %{_datadir}/wayland-sessions/niri.desktop
 %dir %{_datadir}/xdg-desktop-portal
 %{_datadir}/xdg-desktop-portal/niri-portals.conf

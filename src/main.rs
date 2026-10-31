@@ -39,6 +39,10 @@ static GLOBAL: tracy_client::ProfiledAllocator<std::alloc::System> =
     tracy_client::ProfiledAllocator::new(std::alloc::System, 100);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("spawn")) {
+        return niri::utils::spawning::spawn_child().map_err(Into::into);
+    }
+
     // Set backtrace defaults if not set.
     if env::var_os("RUST_BACKTRACE").is_none() {
         env::set_var("RUST_BACKTRACE", "1");
@@ -157,6 +161,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Needs to be done before starting Tracy, so that it applies to Tracy's threads.
     niri::utils::signals::block_early().unwrap();
 
+    // Claim NOTIFY_FD and mark it CLOEXEC before starting any background threads, unless
+    // readiness notifications are disabled (e.g. a wrapper handling readiness itself).
+    let notify_ready = env::var_os("NIRI_DISABLE_SYSTEM_MANAGER_NOTIFY").is_none_or(|x| x != "1");
+    let mut notify_file = notify_ready.then(take_notify_fd).flatten();
+
     // Avoid starting Tracy for the `niri msg` code path since starting/stopping Tracy is a bit
     // slow.
     tracy_client::Client::start();
@@ -183,6 +192,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let spawn_sh_at_startup = mem::take(&mut config.spawn_sh_at_startup);
     *CHILD_ENV.write().unwrap() = mem::take(&mut config.environment);
 
+    niri::utils::spawning::prepare_spawn_helper();
     store_and_increase_nofile_rlimit();
 
     // Create the main event loop.
@@ -242,6 +252,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::remove_var("DISPLAY");
     }
 
+    // Pre-warm spawn helpers once WAYLAND_DISPLAY, DISPLAY, NIRI_SOCKET, and IS_SYSTEMD_SERVICE
+    // are finalized, so they warm in parallel with import_environment() before spawn_at_startup.
+    let startup_count =
+        usize::from(!cli.command.is_empty()) + spawn_at_startup.len() + spawn_sh_at_startup.len();
+    niri::utils::spawning::warm_spawner(1 + startup_count);
+
     if cli.session {
         // We're starting as a session. Import our variables.
         import_environment();
@@ -263,15 +279,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         state.niri.a11y.start();
     }
 
-    if env::var_os("NIRI_DISABLE_SYSTEM_MANAGER_NOTIFY").is_none_or(|x| x != "1") {
+    if notify_ready {
         // Notify systemd we're ready.
         if let Err(err) = sd_notify::notify(&[NotifyState::Ready]) {
             warn!("error notifying systemd: {err:?}");
         };
 
         // Send ready notification to the NOTIFY_FD file descriptor.
-        if let Err(err) = notify_fd() {
-            warn!("error notifying fd: {err:?}");
+        if let Some(mut notif) = notify_file.take() {
+            if let Err(err) = notif.write_all(b"READY=1\n") {
+                warn!("error notifying fd: {err:?}");
+            }
         }
     }
 
@@ -393,16 +411,42 @@ fn config_path(cli_path: Option<PathBuf>) -> ConfigPath {
     }
 }
 
-fn notify_fd() -> anyhow::Result<()> {
-    let fd = match env::var("NOTIFY_FD") {
-        Ok(notify_fd) => notify_fd.parse()?,
-        Err(env::VarError::NotPresent) => return Ok(()),
-        Err(err) => return Err(err.into()),
+fn take_notify_fd() -> Option<File> {
+    let fd: i32 = match env::var("NOTIFY_FD") {
+        Ok(notify_fd) => match notify_fd.parse() {
+            Ok(fd) => fd,
+            Err(err) => {
+                warn!("error parsing NOTIFY_FD: {err:?}");
+                return None;
+            }
+        },
+        Err(env::VarError::NotPresent) => return None,
+        Err(err) => {
+            warn!("error reading NOTIFY_FD: {err:?}");
+            return None;
+        }
     };
     env::remove_var("NOTIFY_FD");
-    let mut notif = unsafe { File::from_raw_fd(fd) };
-    notif.write_all(b"READY=1\n")?;
-    Ok(())
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        if flags == -1 {
+            warn!(
+                "error inspecting NOTIFY_FD ({fd}): {:?}",
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        // Take ownership now that fd is validated so any error below closes it cleanly.
+        let file = File::from_raw_fd(fd);
+        if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+            warn!(
+                "error setting FD_CLOEXEC on NOTIFY_FD ({fd}): {:?}",
+                io::Error::last_os_error()
+            );
+            return None;
+        }
+        Some(file)
+    }
 }
 
 // The wayland-server crate has set_default_max_buffer_size() under a libwayland_1_23 feature, but

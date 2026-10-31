@@ -52,10 +52,15 @@ pub(super) fn isolate(size: HeadlessSize) -> Result<()> {
         command.arg("--chdir").arg(&home);
     }
     // Keep locally installed binaries usable when the private home hides their original path.
+    let executable = env::current_exe()?;
+    let helper_name = crate::utils::spawning::SPAWN_HELPER_NAME;
     command
         .arg("--ro-bind")
-        .arg(env::current_exe()?)
-        .arg("/tmp/niri-mcp");
+        .arg(&executable)
+        .arg("/tmp/niri-mcp")
+        .arg("--ro-bind-try")
+        .arg(executable.with_file_name(helper_name))
+        .arg(Path::new("/tmp").join(helper_name));
     // Stdin EOF ends the session. --die-with-parent also reacts to a spawning
     // thread exiting, which kills healthy sessions launched by a thread pool.
     command

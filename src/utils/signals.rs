@@ -11,7 +11,7 @@
 //!
 //! In particular, if a child doesn't care about signals, we must not block it from receiving them.
 //!
-//! This module provides functions to clear the sigmask. Call them before spawning children.
+//! The spawn helper clears the inherited mask before executing an app.
 //!
 //! Technically, a "more correct" solution would be to remember the original sigmask and restore it
 //! after the child exits, but that's painful *and* likely to cause issues, because the user almost
@@ -20,6 +20,8 @@
 
 pub use platform::*;
 
+pub use crate::spawn_helper::unblock_all;
+
 #[cfg(not(target_os = "linux"))]
 mod platform {
     use std::io;
@@ -27,20 +29,17 @@ mod platform {
     // FIXME: implement for FreeBSD. But probably, that should be done in calloop::signals.
     pub fn listen(_handle: &calloop::LoopHandle<crate::niri::State>) {}
 
-    // These two actually build as-is on FreeBSD, but without our own signal handling in listen(),
-    // they do more harm than good (they block termination signals without actually installing a
-    // termination handler).
+    // Without signal handling in listen(), blocking termination signals would leave no handler.
     pub fn block_early() -> io::Result<()> {
-        Ok(())
-    }
-    pub fn unblock_all() -> io::Result<()> {
         Ok(())
     }
 }
 
 #[cfg(target_os = "linux")]
 mod platform {
-    use std::{io, mem};
+    use std::io;
+
+    use crate::spawn_helper::{empty_sigset, set_sigmask};
 
     pub fn termination_fd() -> io::Result<std::os::fd::OwnedFd> {
         use std::os::fd::FromRawFd;
@@ -74,19 +73,6 @@ mod platform {
         set_sigmask(&preferred_sigset()?)
     }
 
-    pub fn unblock_all() -> io::Result<()> {
-        set_sigmask(&empty_sigset()?)
-    }
-
-    fn empty_sigset() -> io::Result<libc::sigset_t> {
-        let mut sigset = mem::MaybeUninit::uninit();
-        if unsafe { libc::sigemptyset(sigset.as_mut_ptr()) } == 0 {
-            Ok(unsafe { sigset.assume_init() })
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
     fn preferred_sigset() -> io::Result<libc::sigset_t> {
         let mut set = empty_sigset()?;
         unsafe {
@@ -100,15 +86,6 @@ mod platform {
     // SAFETY: `signum` must be a valid signal number.
     unsafe fn add_signal(set: &mut libc::sigset_t, signum: libc::c_int) -> io::Result<()> {
         if unsafe { libc::sigaddset(set, signum) } == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
-    }
-
-    fn set_sigmask(set: &libc::sigset_t) -> io::Result<()> {
-        let oldset = std::ptr::null_mut(); // ignore old mask
-        if unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, set, oldset) } == 0 {
             Ok(())
         } else {
             Err(io::Error::last_os_error())

@@ -2,7 +2,7 @@
 
 The main way of testing niri during development is running it as a nested window. The second step is usually switching to a different TTY and running niri there.
 
-Once a feature or fix is reasonably complete, you generally want to run a local build as your main compositor for proper testing. The easiest way to do that is to install niri normally (from a distro package for example), then overwrite the binary with `sudo cp ./target/release/niri /usr/bin/niri`. Do make sure that you know how to revert to a working version in case everything breaks though.
+Once a feature or fix is reasonably complete, you generally want to run a local build as your main compositor for proper testing. The easiest way to do that is to install niri normally (from a distro package for example), then overwrite the binary with `sudo cp ./target/release/{niri,niri-spawn-v1} /usr/bin/`. Do make sure that you know how to revert to a working version in case everything breaks though.
 
 If you use an RPM-based distro, you can generate an RPM package for a local build with `cargo generate-rpm`.
 

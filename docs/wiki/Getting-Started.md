@@ -228,6 +228,7 @@ This defaults to `/usr/bin/niri`.
 | File | Destination |
 | ---- | ----------- |
 | `target/release/niri` | `/usr/local/bin/` |
+| `target/release/niri-spawn-v1` | `/usr/local/bin/` |
 | `resources/niri-session` | `/usr/local/bin/` |
 | `resources/niri.desktop`  | `/usr/local/share/wayland-sessions/` |
 | `resources/niri-portals.conf` | `/usr/local/share/xdg-desktop-portal/` |

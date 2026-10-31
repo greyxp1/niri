@@ -18,6 +18,7 @@ To do that, put files into the correct directories according to this table.
 | File | Destination |
 | ---- | ----------- |
 | `target/release/niri` | `/usr/bin/` |
+| `target/release/niri-spawn-v1` | `/usr/bin/` |
 | `resources/niri-session` | `/usr/bin/` |
 | `resources/niri.desktop` | `/usr/share/wayland-sessions/` |
 | `resources/niri-portals.conf` | `/usr/share/xdg-desktop-portal/` |

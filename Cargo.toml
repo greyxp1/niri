@@ -39,6 +39,7 @@ rev = "65aa86fa5236e41775c313408102a5d5c2d1e2ca"
 
 [package]
 name = "niri"
+default-run = "niri"
 version.workspace = true
 description.workspace = true
 authors.workspace = true
@@ -56,7 +57,9 @@ accesskit_unix = { version = "0.23", optional = true }
 anyhow.workspace = true
 arrayvec = "0.7.8"
 async-channel = "2.5.0"
+async-executor = { version = "1.14.1", optional = true }
 async-io = { version = "2.6.0", optional = true }
+async-process = "2.5.0"
 atspi = { version = "0.29", default-features = false, features = ["proxies"], optional = true }
 atomic = "0.6.1"
 base64 = "0.21"
@@ -135,7 +138,7 @@ default = ["dbus", "systemd", "xdp-gnome-screencast"]
 # Enables D-Bus support (serve various freedesktop and GNOME interfaces, accessibility tree, power button handling).
 dbus = ["dep:zbus", "dep:async-io", "dep:atspi", "dep:accesskit", "dep:accesskit_unix"]
 # Enables systemd integration (global environment, apps in transient scopes).
-systemd = ["dbus"]
+systemd = ["dbus", "dep:async-executor"]
 # Enables screencasting support through xdg-desktop-portal-gnome.
 xdp-gnome-screencast = ["dbus", "pipewire"]
 # Enables the Tracy profiler instrumentation.
@@ -169,6 +172,7 @@ png.opt-level = 3
 version = "26.04"
 assets = [
     { source = "target/release/niri", dest = "/usr/bin/", mode = "755" },
+    { source = "target/release/niri-spawn-v1", dest = "/usr/bin/", mode = "755" },
     { source = "resources/niri-session", dest = "/usr/bin/", mode = "755" },
     { source = "resources/niri.desktop", dest = "/usr/share/wayland-sessions/", mode = "644" },
     { source = "resources/niri-portals.conf", dest = "/usr/share/xdg-desktop-portal/", mode = "644" },
@@ -183,6 +187,7 @@ fuzzel = "*"
 depends = "alacritty, fuzzel"
 assets = [
     ["target/release/niri", "usr/bin/", "755"],
+    ["target/release/niri-spawn-v1", "usr/bin/", "755"],
     ["resources/niri-session", "usr/bin/", "755"],
     ["resources/niri.desktop", "/usr/share/wayland-sessions/", "644"],
     ["resources/niri-portals.conf", "/usr/share/xdg-desktop-portal/", "644"],

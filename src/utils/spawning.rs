@@ -1,16 +1,19 @@
-use std::ffi::OsStr;
-use std::os::unix::process::CommandExt;
-use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::collections::BTreeMap;
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::RwLock;
+use std::sync::{LazyLock, Mutex as StdMutex, RwLock};
 use std::{io, thread};
 
-use atomic::Atomic;
-use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
+use libc::{getrlimit, rlimit, setrlimit, RLIMIT_NOFILE};
 use niri_config::Environment;
 use smithay::wayland::xdg_activation::XdgActivationToken;
 
+#[doc(hidden)]
+pub use crate::spawn_helper::spawn_child;
+use crate::spawn_helper::SpawnRequest;
 use crate::utils::expand_home;
 
 pub static REMOVE_ENV_RUST_BACKTRACE: AtomicBool = AtomicBool::new(false);
@@ -18,8 +21,10 @@ pub static REMOVE_ENV_RUST_LIB_BACKTRACE: AtomicBool = AtomicBool::new(false);
 pub static CHILD_ENV: RwLock<Environment> = RwLock::new(Environment(Vec::new()));
 pub static CHILD_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
 
-static ORIGINAL_NOFILE_RLIMIT_CUR: Atomic<rlim_t> = Atomic::new(0);
-static ORIGINAL_NOFILE_RLIMIT_MAX: Atomic<rlim_t> = Atomic::new(0);
+static ORIGINAL_NOFILE_RLIMIT: StdMutex<rlimit> = StdMutex::new(rlimit {
+    rlim_cur: 0,
+    rlim_max: 0,
+});
 
 /// Increases the nofile rlimit to the maximum and stores the original value.
 pub fn store_and_increase_nofile_rlimit() {
@@ -33,8 +38,7 @@ pub fn store_and_increase_nofile_rlimit() {
         return;
     }
 
-    ORIGINAL_NOFILE_RLIMIT_CUR.store(rlim.rlim_cur, Ordering::SeqCst);
-    ORIGINAL_NOFILE_RLIMIT_MAX.store(rlim.rlim_max, Ordering::SeqCst);
+    *ORIGINAL_NOFILE_RLIMIT.lock().unwrap() = rlim;
 
     trace!(
         "changing nofile rlimit from {} to {}",
@@ -49,37 +53,60 @@ pub fn store_and_increase_nofile_rlimit() {
     }
 }
 
-/// Restores the original nofile rlimit.
-pub fn restore_nofile_rlimit() {
-    let rlim_cur = ORIGINAL_NOFILE_RLIMIT_CUR.load(Ordering::SeqCst);
-    let rlim_max = ORIGINAL_NOFILE_RLIMIT_MAX.load(Ordering::SeqCst);
+struct SpawnCommand {
+    command: Vec<OsString>,
+    token: Option<XdgActivationToken>,
+}
 
-    if rlim_cur == 0 {
-        return;
+#[cfg(feature = "systemd")]
+const MAX_INITIAL_WARM_HELPERS: usize = 4;
+
+fn spawner(initial_warm: usize) -> io::Result<async_channel::Sender<SpawnCommand>> {
+    static SPAWNER: StdMutex<Option<async_channel::Sender<SpawnCommand>>> = StdMutex::new(None);
+    let mut spawner = SPAWNER.lock().unwrap();
+    if let Some(sender) = spawner.as_ref().filter(|sender| !sender.is_closed()) {
+        return Ok(sender.clone());
     }
 
-    let rlim = rlimit { rlim_cur, rlim_max };
-    unsafe { setrlimit(RLIMIT_NOFILE, &rlim) };
+    #[cfg(not(feature = "systemd"))]
+    let _ = initial_warm;
+
+    // Spawned apps like Bubblewrap (`--die-with-parent`) set PR_SET_PDEATHSIG, which Linux ties to
+    // the thread that created the child.
+    let (sender, receiver) = async_channel::unbounded();
+    thread::Builder::new()
+        .name("Command Spawner".to_owned())
+        .spawn(move || {
+            #[cfg(feature = "systemd")]
+            if systemd::active() {
+                systemd::run(receiver, initial_warm.clamp(1, MAX_INITIAL_WARM_HELPERS));
+                return;
+            }
+            run_direct(receiver);
+        })?;
+    *spawner = Some(sender.clone());
+    Ok(sender)
 }
 
 /// Spawns the command to run independently of the compositor.
-pub fn spawn<T: AsRef<OsStr> + Send + 'static>(command: Vec<T>, token: Option<XdgActivationToken>) {
+pub fn spawn<T: AsRef<OsStr>>(command: Vec<T>, token: Option<XdgActivationToken>) {
     let _span = tracy_client::span!();
 
     if command.is_empty() {
         return;
     }
 
-    // Spawning and waiting takes some milliseconds, so do it in a thread.
-    let res = thread::Builder::new()
-        .name("Command Spawner".to_owned())
-        .spawn(move || {
-            let (command, args) = command.split_first().unwrap();
-            spawn_sync(command, args, token);
-        });
+    let spawner = match spawner(1) {
+        Ok(spawner) => spawner,
+        Err(err) => {
+            warn!("error starting the command spawner: {err:?}");
+            return;
+        }
+    };
 
-    if let Err(err) = res {
-        warn!("error spawning a thread to spawn the command: {err:?}");
+    let command = command.iter().map(|arg| arg.as_ref().to_owned()).collect();
+    if let Err(err) = spawner.try_send(SpawnCommand { command, token }) {
+        warn!("error sending command to the spawner: {err:?}");
     }
 }
 
@@ -93,14 +120,11 @@ pub fn spawn_sh(command: String, token: Option<XdgActivationToken>) {
     spawn(vec![String::from("sh"), String::from("-c"), command], token);
 }
 
-fn spawn_sync(
-    command: impl AsRef<OsStr>,
-    args: impl IntoIterator<Item = impl AsRef<OsStr>>,
-    token: Option<XdgActivationToken>,
-) {
+fn build_spawn_request(SpawnCommand { command, token }: SpawnCommand) -> SpawnRequest {
     let _span = tracy_client::span!();
 
-    let mut command = command.as_ref();
+    let (program, args) = command.split_first().unwrap();
+    let mut command = program.as_os_str();
 
     // Expand `~` at the start.
     let expanded = expand_home(Path::new(command));
@@ -112,378 +136,550 @@ fn spawn_sync(
         }
     }
 
-    let mut process = Command::new(command);
-    process
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    // Remove RUST_BACKTRACE and RUST_LIB_BACKTRACE from the environment if needed.
-    if REMOVE_ENV_RUST_BACKTRACE.load(Ordering::Relaxed) {
-        process.env_remove("RUST_BACKTRACE");
-    }
-    if REMOVE_ENV_RUST_LIB_BACKTRACE.load(Ordering::Relaxed) {
-        process.env_remove("RUST_LIB_BACKTRACE");
-    }
-
-    // Remove the systemd NOTIFY_SOCKET variable.
-    process.env_remove("NOTIFY_SOCKET");
-
-    // Set DISPLAY if needed.
-    let display = CHILD_DISPLAY.read().unwrap();
-    if let Some(display) = &*display {
-        process.env("DISPLAY", display);
-    } else {
-        process.env_remove("DISPLAY");
-    }
-
-    // Set configured environment.
-    let env = CHILD_ENV.read().unwrap();
-    for var in &env.0 {
-        if let Some(value) = &var.value {
-            process.env(&var.name, value);
-        } else {
-            process.env_remove(&var.name);
+    // Keep the overrides out of the helper's own environment. Forward cursor env vars too
+    // because CursorManager::reload mutates them at runtime after a warm helper was started.
+    let mut env = BTreeMap::from([
+        (
+            "DISPLAY".into(),
+            CHILD_DISPLAY.read().unwrap().clone().map(OsString::from),
+        ),
+        ("NOTIFY_SOCKET".into(), None),
+        ("XCURSOR_THEME".into(), std::env::var_os("XCURSOR_THEME")),
+        ("XCURSOR_SIZE".into(), std::env::var_os("XCURSOR_SIZE")),
+    ]);
+    for (name, remove) in [
+        ("RUST_BACKTRACE", &REMOVE_ENV_RUST_BACKTRACE),
+        ("RUST_LIB_BACKTRACE", &REMOVE_ENV_RUST_LIB_BACKTRACE),
+    ] {
+        if remove.load(Ordering::Relaxed) {
+            env.insert(name.into(), None);
         }
     }
-    drop(env);
-
-    if let Some(token) = token.as_ref() {
-        process.env("XDG_ACTIVATION_TOKEN", token.as_str());
-        process.env("DESKTOP_STARTUP_ID", token.as_str());
+    for var in &CHILD_ENV.read().unwrap().0 {
+        env.insert(
+            var.name.as_str().into(),
+            var.value.as_deref().map(OsString::from),
+        );
+    }
+    if let Some(token) = token {
+        for name in ["XDG_ACTIVATION_TOKEN", "DESKTOP_STARTUP_ID"] {
+            env.insert(name.into(), Some(token.as_str().into()));
+        }
     }
 
-    unsafe { process.pre_exec(crate::utils::signals::unblock_all) };
-
-    let Some(mut child) = do_spawn(command, process) else {
-        return;
-    };
-
-    match child.wait() {
-        Ok(status) => {
-            if !status.success() {
-                warn!("child did not exit successfully: {status:?}");
-            }
-        }
-        Err(err) => {
-            warn!("error waiting for child: {err:?}");
-        }
+    let rlim = *ORIGINAL_NOFILE_RLIMIT.lock().unwrap();
+    SpawnRequest {
+        // Preserve invalid NULs so the helper's Command rejects them.
+        program: command.to_owned(),
+        args: args.to_vec(),
+        env: env.into_iter().collect(),
+        nofile_soft: rlim.rlim_cur,
+        nofile_hard: rlim.rlim_max,
     }
 }
 
-#[cfg(not(feature = "systemd"))]
-fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
-    unsafe {
-        // Double-fork to avoid having to waitpid the child.
-        process.pre_exec(move || {
-            match libc::fork() {
-                -1 => return Err(io::Error::last_os_error()),
-                0 => (),
-                _ => libc::_exit(0),
+fn run_direct(receiver: async_channel::Receiver<SpawnCommand>) {
+    let mut warm: Option<(async_process::Child, io::PipeWriter)> = start_spawn_helper().ok();
+
+    while let Ok(command) = receiver.recv_blocking() {
+        let request = build_spawn_request(command);
+        let program = request.program.clone();
+        let data = match serde_json::to_vec(&request) {
+            Ok(data) => data,
+            Err(err) => {
+                warn!("error serializing spawn request for {program:?}: {err:?}");
+                continue;
             }
+        };
 
-            restore_nofile_rlimit();
+        let mut launched = false;
+        if let Some((mut child, mut writer)) = warm.take() {
+            if matches!(child.try_status(), Ok(None)) && writer.write_all(&data).is_ok() {
+                drop(writer);
+                drop(child);
+                launched = true;
+            } else {
+                drop(writer);
+                drop(child);
+            }
+        }
 
-            Ok(())
-        });
+        if !launched {
+            if let Err(err) = launch_helper_direct(&data) {
+                warn!("error sending {program:?} to the spawn helper: {err:?}");
+            }
+        }
+
+        warm = start_spawn_helper().ok();
     }
+}
 
-    let child = match process.spawn() {
-        Ok(child) => child,
-        Err(err) => {
-            warn!("error spawning {command:?}: {err:?}");
+struct SpawnHelper {
+    path: PathBuf,
+    #[cfg(target_os = "linux")]
+    _file: std::fs::File,
+}
+
+// Update this name with incompatible changes to SpawnRequest.
+pub(crate) const SPAWN_HELPER_NAME: &str = "niri-spawn-v1";
+static SPAWN_HELPER: LazyLock<Option<SpawnHelper>> = LazyLock::new(SpawnHelper::find);
+
+#[doc(hidden)]
+pub fn prepare_spawn_helper() {
+    LazyLock::force(&SPAWN_HELPER);
+}
+
+#[doc(hidden)]
+pub fn warm_spawner(initial_warm: usize) {
+    let _ = spawner(initial_warm);
+}
+
+impl SpawnHelper {
+    fn find() -> Option<Self> {
+        let path = std::env::current_exe()
+            .ok()?
+            .with_file_name(SPAWN_HELPER_NAME);
+        if !path.is_file() {
             return None;
         }
-    };
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
 
-    Some(child)
+            // Keep using this helper if an upgrade replaces it while Niri is running.
+            let file = std::fs::File::open(path).ok()?;
+            let path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+            Some(Self { path, _file: file })
+        }
+        #[cfg(not(target_os = "linux"))]
+        Some(Self { path })
+    }
 }
 
-#[cfg(feature = "systemd")]
-use systemd::do_spawn;
+fn spawn_with_input(
+    mut command: async_process::Command,
+) -> io::Result<(async_process::Child, io::PipeWriter)> {
+    let (input, writer) = io::pipe()?;
+    // Keep setup out of pre_exec so launching the helper can use posix_spawn.
+    let child = command.stdin(Stdio::from(input)).spawn()?;
+    Ok((child, writer))
+}
+
+fn start_spawn_helper() -> io::Result<(async_process::Child, io::PipeWriter)> {
+    if let Some(helper) = &*SPAWN_HELPER {
+        use async_process::unix::CommandExt as _;
+
+        let mut command = async_process::Command::new(&helper.path);
+        // Set argv[0] so /proc/self/fd/<fd> shows up as niri-spawn-v1 in ps.
+        command.arg0(SPAWN_HELPER_NAME);
+        match spawn_with_input(command) {
+            Ok(child) => return Ok(child),
+            Err(err) => debug!("error starting the packaged spawn helper: {err}"),
+        }
+    }
+
+    // A standalone Niri executable can still launch apps.
+    #[cfg(target_os = "linux")]
+    let executable = linux_executable()?;
+    #[cfg(not(target_os = "linux"))]
+    let executable = std::env::current_exe()?;
+    let mut command = async_process::Command::new(executable);
+    command.arg("spawn");
+    spawn_with_input(command)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_executable() -> io::Result<PathBuf> {
+    use std::ffi::CStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let proc_exe = Path::new("/proc/self/exe");
+    if proc_exe.exists() {
+        return Ok(proc_exe.to_owned());
+    }
+
+    // In a sandbox without procfs, use the exec path the kernel supplied at startup.
+    let path = unsafe { libc::getauxval(libc::AT_EXECFN) } as *const libc::c_char;
+    if path.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let path = unsafe { CStr::from_ptr(path) };
+    std::path::absolute(OsStr::from_bytes(path.to_bytes()))
+}
+
+fn launch_helper_direct(data: &[u8]) -> anyhow::Result<()> {
+    let (child, mut writer) = start_spawn_helper()?;
+    writer.write_all(data)?;
+    // async-process reaps children without blocking the spawning thread.
+    drop(child);
+    Ok(())
+}
 
 #[cfg(feature = "systemd")]
 mod systemd {
-    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::cell::RefCell;
+    use std::collections::VecDeque;
+    use std::future::Future;
+    use std::rc::Rc;
+    use std::task::Poll;
+    use std::time::{Duration, Instant};
 
-    use smithay::reexports::rustix;
-    use smithay::reexports::rustix::io::{close, read, retry_on_intr, write};
-    use smithay::reexports::rustix::pipe::{pipe_with, PipeFlags};
+    use anyhow::Context;
+    use async_executor::LocalExecutor;
+    use futures_util::future::{select, Either};
+    use futures_util::io::AsyncWriteExt;
+    use futures_util::lock::Mutex;
+    use futures_util::StreamExt;
+    use zbus::zvariant::{OwnedObjectPath, Value};
 
     use super::*;
 
-    pub fn do_spawn(command: &OsStr, mut process: Command) -> Option<Child> {
-        #[cfg(target_env = "gnu")]
-        use libc::close_range;
-        #[cfg(target_os = "openbsd")]
-        use libc::closefrom;
+    const SCOPE_TIMEOUT: Duration = Duration::from_secs(5);
+    // POSIX PIPE_BUF: a single write of this size to a fresh empty pipe does not block.
+    const SYNC_PIPE_WRITE_LIMIT: usize = 4096;
 
-        #[cfg(not(target_env = "gnu"))] // musl
-        pub fn close_range(
-            first: libc::c_uint,
-            last: libc::c_uint,
-            flags: libc::c_uint,
-        ) -> libc::c_long {
-            unsafe {
-                libc::syscall(
-                    libc::SYS_close_range,
-                    first as usize,
-                    last as usize,
-                    flags as usize,
-                )
+    struct WarmHelper {
+        child: async_process::Child,
+        writer: io::PipeWriter,
+    }
+
+    struct WarmState {
+        ready: VecDeque<WarmHelper>,
+        warming: usize,
+        target: usize,
+    }
+
+    pub(super) fn active() -> bool {
+        crate::utils::IS_SYSTEMD_SERVICE.load(Ordering::Relaxed)
+    }
+
+    pub(super) fn run(receiver: async_channel::Receiver<SpawnCommand>, initial_warm: usize) {
+        // LocalExecutor keeps every start_spawn_helper() call on this long-lived spawner thread so
+        // children using PR_SET_PDEATHSIG (e.g. Bubblewrap) do not get killed when a worker exits.
+        let executor = Rc::new(LocalExecutor::new());
+        let state = Rc::new(RefCell::new(WarmState {
+            ready: VecDeque::new(),
+            warming: 0,
+            target: initial_warm,
+        }));
+
+        async_io::block_on(executor.run(async {
+            ensure_warming(&executor, &state);
+
+            while let Ok(command) = receiver.recv().await {
+                launch_command(&executor, &state, command);
+                // Let background warming and burst tasks make progress between queued commands.
+                yield_once().await;
             }
-        }
+        }));
+    }
 
-        // When running as a systemd session, we want to put children into their own transient
-        // scopes in order to separate them from the niri process. This is helpful for
-        // example to prevent the OOM killer from taking down niri together with a
-        // misbehaving client.
-        //
-        // Putting a child into a scope is done by calling systemd's StartTransientUnit D-Bus method
-        // with a PID. Unfortunately, there seems to be a race in systemd where if the child exits
-        // at just the right time, the transient unit will be created but empty, so it will
-        // linger around forever.
-        //
-        // To prevent this, we'll use our double-fork (done for a separate reason) to help. In our
-        // intermediate child we will send back the grandchild PID, and in niri we will create a
-        // transient scope with both our intermediate child and the grandchild PIDs set. Only then
-        // we will signal our intermediate child to exit. This way, even if the grandchild
-        // exits quickly, a non-empty scope will be created (with just our intermediate
-        // child), then cleaned up when our intermediate child exits.
+    async fn yield_once() {
+        let mut first_poll = true;
+        std::future::poll_fn(|cx| {
+            if std::mem::take(&mut first_poll) {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(())
+            }
+        })
+        .await;
+    }
 
-        // Make a pipe to receive the grandchild PID.
+    fn ensure_warming(executor: &Rc<LocalExecutor<'static>>, state: &Rc<RefCell<WarmState>>) {
+        let to_spawn = {
+            let mut warm = state.borrow_mut();
+            let have = warm.ready.len() + warm.warming;
+            let needed = warm.target.saturating_sub(have);
+            warm.warming += needed;
+            needed
+        };
 
-        let (pipe_pid_read, pipe_pid_write) = pipe_with(PipeFlags::CLOEXEC)
-            .map_err(|err| {
-                warn!("error creating a pipe to transfer child PID: {err:?}");
-            })
-            .ok()
-            .unzip();
-        // Make a pipe to wait in the intermediate child.
-        let (pipe_wait_read, pipe_wait_write) = pipe_with(PipeFlags::CLOEXEC)
-            .map_err(|err| {
-                warn!("error creating a pipe for child to wait on: {err:?}");
-            })
-            .ok()
-            .unzip();
-
-        unsafe {
-            // The fds will be duplicated after a fork and closed on exec or exit automatically. Get
-            // the raw fd inside so that it's not closed any extra times.
-            let mut pipe_pid_read_fd = pipe_pid_read.as_ref().map(|fd| fd.as_raw_fd());
-            let mut pipe_pid_write_fd = pipe_pid_write.as_ref().map(|fd| fd.as_raw_fd());
-            let mut pipe_wait_read_fd = pipe_wait_read.as_ref().map(|fd| fd.as_raw_fd());
-            let mut pipe_wait_write_fd = pipe_wait_write.as_ref().map(|fd| fd.as_raw_fd());
-
-            // Double-fork to avoid having to waitpid the child.
-            process.pre_exec(move || {
-                // Close FDs that we don't need. Especially important for the write ones to unblock
-                // the readers.
-                if let Some(fd) = pipe_pid_read_fd.take() {
-                    close(fd);
-                }
-                if let Some(fd) = pipe_wait_write_fd.take() {
-                    close(fd);
-                }
-
-                // Convert the FDs to OwnedFd, which will close them in all of our fork paths.
-                let pipe_pid_write = pipe_pid_write_fd.take().map(|fd| OwnedFd::from_raw_fd(fd));
-                let pipe_wait_read = pipe_wait_read_fd.take().map(|fd| OwnedFd::from_raw_fd(fd));
-
-                match libc::fork() {
-                    -1 => return Err(io::Error::last_os_error()),
-                    0 => (),
-                    grandchild_pid => {
-                        // Send back the PID.
-                        if let Some(pipe) = pipe_pid_write {
-                            let _ = write_all(pipe, &grandchild_pid.to_ne_bytes());
+        for _ in 0..to_spawn {
+            let state = Rc::clone(state);
+            executor
+                .spawn(async move {
+                    let helper = warm_helper().await;
+                    let mut warm = state.borrow_mut();
+                    warm.warming = warm.warming.saturating_sub(1);
+                    if let Some(helper) = helper {
+                        if warm.ready.len() < warm.target {
+                            warm.ready.push_back(helper);
                         }
-
-                        // Wait until the parent signals us to exit.
-                        if let Some(pipe) = pipe_wait_read {
-                            // We're going to exit afterwards. Close all other FDs to allow
-                            // Command::spawn() to return in the parent process.
-                            #[cfg(not(target_os = "openbsd"))]
-                            {
-                                let raw = pipe.as_raw_fd() as u32;
-                                let _ = close_range(0, raw - 1, 0);
-                                let _ = close_range(raw + 1, !0, 0);
-                            }
-                            #[cfg(target_os = "openbsd")]
-                            {
-                                let raw = pipe.as_raw_fd();
-                                for fd in 0..raw {
-                                    close(fd);
-                                }
-                                closefrom(raw + 1);
-                            }
-
-                            let _ = read_all(pipe, &mut [0]);
-                        }
-
-                        libc::_exit(0)
                     }
-                }
-
-                restore_nofile_rlimit();
-
-                Ok(())
-            });
+                })
+                .detach();
         }
+    }
 
-        let child = match process.spawn() {
-            Ok(child) => child,
+    fn take_warm_helper(state: &Rc<RefCell<WarmState>>) -> Option<WarmHelper> {
+        let mut warm = state.borrow_mut();
+        // After startup burst helpers are consumed, settle back to 1 idle helper.
+        if warm.target > 1 {
+            warm.target -= 1;
+        }
+        while let Some(mut helper) = warm.ready.pop_front() {
+            if matches!(helper.child.try_status(), Ok(None)) {
+                return Some(helper);
+            }
+            debug!("discarding exited pre-warmed spawn helper");
+            drop(helper);
+        }
+        None
+    }
+
+    async fn warm_helper() -> Option<WarmHelper> {
+        let (child, writer) = match start_spawn_helper() {
+            Ok(pair) => pair,
             Err(err) => {
-                warn!("error spawning {command:?}: {err:?}");
+                warn!("error starting pre-warmed spawn helper: {err:?}");
                 return None;
             }
         };
 
-        drop(pipe_pid_write);
-        drop(pipe_wait_read);
+        // Only cache helpers that systemd confirmed in a scope; otherwise drop it so the next
+        // launch retries scoping once the session bus recovers.
+        if !place_in_scope(child.id()).await {
+            drop(writer);
+            drop(child);
+            return None;
+        }
+        Some(WarmHelper { child, writer })
+    }
 
-        // Wait for the grandchild PID.
-        if let Some(pipe) = pipe_pid_read {
-            let mut buf = [0; 4];
-            match read_all(pipe, &mut buf) {
-                Ok(()) => {
-                    let pid = i32::from_ne_bytes(buf);
-                    trace!("spawned PID: {pid}");
+    async fn place_in_scope(pid: u32) -> bool {
+        let Some(manager) = manager().await else {
+            return false;
+        };
 
-                    // Start a systemd scope for the grandchild.
-                    if let Err(err) = start_systemd_scope(command, child.id(), pid as u32) {
-                        trace!("error starting systemd scope for spawned command: {err:?}");
+        // Keep the app-niri- prefix so app-.scope.d/ and app-niri-.scope.d/ drop-ins apply, while
+        // avoiding a reverse-DNS app ID that xdg-desktop-portal could misattribute.
+        let scope_name = format!("app-niri-spawn-{pid}.scope");
+        match with_timeout(
+            SCOPE_TIMEOUT,
+            start_systemd_scope(&manager, &scope_name, pid),
+        )
+        .await
+        {
+            Some(Ok(())) => true,
+            Some(Err(err)) => {
+                warn!("error starting systemd scope {scope_name}: {err:#}");
+                false
+            }
+            None => {
+                warn!("timed out starting systemd scope {scope_name}");
+                false
+            }
+        }
+    }
+
+    fn launch_command(
+        executor: &Rc<LocalExecutor<'static>>,
+        state: &Rc<RefCell<WarmState>>,
+        command: SpawnCommand,
+    ) {
+        let request = build_spawn_request(command);
+        let program = request.program.clone();
+        let data = match serde_json::to_vec(&request) {
+            Ok(data) => data,
+            Err(err) => {
+                warn!("error serializing spawn request for {program:?}: {err:?}");
+                return;
+            }
+        };
+
+        // Fast path: reuse a live pre-warmed helper that is already in its own scope.
+        let warm = take_warm_helper(state);
+        if let Some(mut warm) = warm {
+            ensure_warming(executor, state);
+
+            if data.len() <= SYNC_PIPE_WRITE_LIMIT {
+                match warm.writer.write_all(&data) {
+                    Ok(()) => {
+                        drop(warm.writer);
+                        drop(warm.child);
+                        return;
+                    }
+                    Err(err) => {
+                        debug!(
+                            "pre-warmed spawn helper pipe failed ({err:?}); falling back to fresh helper"
+                        );
+                        drop(warm.writer);
+                        drop(warm.child);
                     }
                 }
-                Err(err) => {
-                    warn!("error reading child PID: {err:?}");
-                }
-            }
-        }
-
-        // Signal the intermediate child to exit now that we're done trying to creating a systemd
-        // scope.
-        trace!("signaling child to exit");
-        drop(pipe_wait_write);
-
-        Some(child)
-    }
-
-    fn write_all(fd: impl AsFd, buf: &[u8]) -> rustix::io::Result<()> {
-        let mut written = 0;
-        loop {
-            let n = retry_on_intr(|| write(&fd, &buf[written..]))?;
-            if n == 0 {
-                return Err(rustix::io::Errno::CANCELED);
-            }
-
-            written += n;
-            if written == buf.len() {
-                return Ok(());
-            }
-        }
-    }
-
-    fn read_all(fd: impl AsFd, buf: &mut [u8]) -> rustix::io::Result<()> {
-        let mut start = 0;
-        loop {
-            let n = retry_on_intr(|| read(&fd, &mut buf[start..]))?;
-            if n == 0 {
-                return Err(rustix::io::Errno::CANCELED);
-            }
-
-            start += n;
-            if start == buf.len() {
-                return Ok(());
-            }
-        }
-    }
-
-    /// Puts a (newly spawned) pid into a transient systemd scope.
-    ///
-    /// This separates the pid from the compositor scope, which for example prevents the OOM killer
-    /// from bringing down the compositor together with a misbehaving client.
-    fn start_systemd_scope(
-        name: &OsStr,
-        intermediate_pid: u32,
-        child_pid: u32,
-    ) -> anyhow::Result<()> {
-        use std::fmt::Write as _;
-        use std::os::unix::ffi::OsStrExt;
-        use std::sync::OnceLock;
-
-        use anyhow::Context;
-        use zbus::zvariant::{OwnedObjectPath, Value};
-
-        use crate::utils::IS_SYSTEMD_SERVICE;
-
-        // We only start transient scopes if we're a systemd service ourselves.
-        if !IS_SYSTEMD_SERVICE.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-
-        let _span = tracy_client::span!();
-
-        // Extract the basename.
-        let name = Path::new(name).file_name().unwrap_or(name);
-
-        let mut scope_name = String::from("app-niri-");
-
-        // Escape for systemd similarly to libgnome-desktop, which says it had adapted this from
-        // systemd source.
-        for &c in name.as_bytes() {
-            if c.is_ascii_alphanumeric() || matches!(c, b':' | b'_' | b'.') {
-                scope_name.push(char::from(c));
             } else {
-                let _ = write!(scope_name, "\\x{c:02x}");
+                let child = warm.child;
+                let writer = warm.writer;
+                executor
+                    .spawn(async move {
+                        if let Err(err) = write_pipe_async(writer, &data).await {
+                            debug!(
+                                "pre-warmed spawn helper async pipe failed ({err:?}); falling back to fresh helper"
+                            );
+                            drop(child);
+                            // spawn_child reads stdin to EOF before exec, so a failed write cannot
+                            // have launched the target yet.
+                            launch_fresh_async(program, data).await;
+                            return;
+                        }
+                        drop(child);
+                    })
+                    .detach();
+                return;
             }
         }
 
-        let _ = write!(scope_name, "-{child_pid}.scope");
+        // Burst/fallback path: start a fresh helper, place it in its scope before exec so
+        // immediate forks stay contained and empty-scope races cannot happen, then send the
+        // request.
+        ensure_warming(executor, state);
+        executor
+            .spawn(async move {
+                launch_fresh_async(program, data).await;
+            })
+            .detach();
+    }
 
-        // Ask systemd to start a transient scope.
-        static CONNECTION: OnceLock<zbus::Result<zbus::blocking::Connection>> = OnceLock::new();
-        let conn = CONNECTION
-            .get_or_init(zbus::blocking::Connection::session)
-            .clone()
-            .context("error connecting to session bus")?;
+    async fn launch_fresh_async(program: OsString, data: Vec<u8>) {
+        let (child, writer) = match start_spawn_helper() {
+            Ok(pair) => pair,
+            Err(err) => {
+                warn!("error starting fallback spawn helper for {program:?}: {err:?}");
+                return;
+            }
+        };
+        place_in_scope(child.id()).await;
+        if let Err(err) = write_pipe_async(writer, &data).await {
+            warn!("error sending {program:?} to the fallback spawn helper: {err:?}");
+        }
+        drop(child);
+    }
 
-        let proxy = zbus::blocking::Proxy::new(
-            &conn,
-            "org.freedesktop.systemd1",
-            "/org/freedesktop/systemd1",
-            "org.freedesktop.systemd1.Manager",
-        )
-        .context("error creating a Proxy")?;
+    async fn write_pipe_async(writer: io::PipeWriter, data: &[u8]) -> io::Result<()> {
+        let mut writer = async_io::Async::new(writer)?;
+        writer.write_all(data).await?;
+        writer.close().await?;
+        Ok(())
+    }
 
-        let signals = proxy
+    enum BusState {
+        Disconnected,
+        // Reusing the proxy keeps zbus's watch on systemd's bus name across launches.
+        Connected(zbus::Proxy<'static>),
+        Backoff(Instant),
+    }
+
+    async fn with_timeout<T>(timeout: Duration, future: impl Future<Output = T>) -> Option<T> {
+        match select(std::pin::pin!(future), async_io::Timer::after(timeout)).await {
+            Either::Left((result, _)) => Some(result),
+            Either::Right(_) => None,
+        }
+    }
+
+    async fn manager() -> Option<zbus::Proxy<'static>> {
+        static BUS: Mutex<BusState> = Mutex::new(BusState::Disconnected);
+        const CONNECT_TIMEOUT: Duration = Duration::from_secs(1);
+
+        let mut bus = BUS.lock().await;
+        match &*bus {
+            BusState::Connected(proxy) if !proxy.connection().is_closed() => {
+                return Some(proxy.clone());
+            }
+            BusState::Backoff(retry_at) if Instant::now() < *retry_at => return None,
+            _ => (),
+        }
+
+        let connect = async {
+            zbus::Proxy::new_owned(
+                zbus::Connection::session().await?,
+                "org.freedesktop.systemd1",
+                "/org/freedesktop/systemd1",
+                "org.freedesktop.systemd1.Manager",
+            )
+            .await
+        };
+        match with_timeout(CONNECT_TIMEOUT, connect).await {
+            Some(Ok(proxy)) => {
+                *bus = BusState::Connected(proxy.clone());
+                return Some(proxy);
+            }
+            Some(Err(err)) => {
+                warn!("could not connect to the session bus for systemd scopes: {err}");
+            }
+            None => warn!("timed out connecting to the session bus for systemd scopes"),
+        }
+        // Let the other pending launches proceed without repeating a failed handshake.
+        *bus = BusState::Backoff(Instant::now() + CONNECT_TIMEOUT);
+        None
+    }
+
+    async fn start_systemd_scope(
+        proxy: &zbus::Proxy<'_>,
+        scope_name: &str,
+        pid: u32,
+    ) -> anyhow::Result<()> {
+        // Drain `JobRemoved` concurrently while `StartTransientUnit` is pending: zbus shares a
+        // bounded broadcast queue across identical match rules and its socket reader stalls if any
+        // subscriber stops polling. Filtering by `arg2` is avoided because dbus-broker 28 (RHEL 9 /
+        // AlmaLinux 9) checks arg0's type for all `argN` matches and rejects `arg2` on
+        // `JobRemoved`.
+        let mut signals = proxy
             .receive_signal("JobRemoved")
+            .await
             .context("error creating a signal iterator")?;
 
-        let pids: &[_] = &[intermediate_pid, child_pid];
-        let properties: &[_] = &[
+        let pids: &[_] = &[pid];
+        let properties: &[(&str, Value)] = &[
             ("PIDs", Value::new(pids)),
             ("CollectMode", Value::new("inactive-or-failed")),
         ];
         let aux: &[(&str, &[(&str, Value)])] = &[];
 
-        let job: OwnedObjectPath = proxy
-            .call("StartTransientUnit", &(scope_name, "fail", properties, aux))
-            .context("error calling StartTransientUnit")?;
+        let body = (scope_name, "fail", properties, aux);
+        let mut call =
+            std::pin::pin!(proxy.call::<_, _, OwnedObjectPath>("StartTransientUnit", &body));
+        let mut early_result: Option<(OwnedObjectPath, String)> = None;
+
+        let job = loop {
+            match select(call.as_mut(), signals.next()).await {
+                Either::Left((reply, _)) => {
+                    break reply.context("error calling StartTransientUnit")?;
+                }
+                Either::Right((Some(message), _)) => {
+                    let body = message.body();
+                    let body: (u32, OwnedObjectPath, &str, &str) =
+                        body.deserialize().context("error parsing signal")?;
+                    if body.2 == scope_name {
+                        early_result = Some((body.1, body.3.to_owned()));
+                    }
+                }
+                Either::Right((None, _)) => {
+                    anyhow::bail!("lost the systemd connection before the scope started");
+                }
+            }
+        };
+
+        if let Some((removed_job, result)) = early_result {
+            if removed_job == job {
+                anyhow::ensure!(result == "done", "systemd scope job ended with {result}");
+                return Ok(());
+            }
+        }
 
         trace!("waiting for JobRemoved");
-        for message in signals {
+        while let Some(message) = signals.next().await {
             let body = message.body();
             let body: (u32, OwnedObjectPath, &str, &str) =
                 body.deserialize().context("error parsing signal")?;
 
             if body.1 == job {
-                // Our transient unit had started, we're good to exit the intermediate child.
-                break;
+                anyhow::ensure!(body.3 == "done", "systemd scope job ended with {}", body.3);
+                return Ok(());
             }
         }
 
-        Ok(())
+        anyhow::bail!("lost the systemd connection before the scope started")
     }
 }
