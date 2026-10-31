@@ -58,6 +58,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with_ansi_sanitization(false)
         .init();
 
+    if env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new("spawn")) {
+        return niri::utils::spawning::spawn_child().map_err(Into::into);
+    }
+
     if env::var_os("NOTIFY_SOCKET").is_some() {
         IS_SYSTEMD_SERVICE.store(true, Ordering::Relaxed);
 
