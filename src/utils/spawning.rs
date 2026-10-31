@@ -1,4 +1,5 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
+use std::io::Write;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -9,9 +10,10 @@ use std::{io, thread};
 use atomic::Atomic;
 use libc::{getrlimit, rlim_t, rlimit, setrlimit, RLIMIT_NOFILE};
 use niri_config::Environment;
+use serde::{Deserialize, Serialize};
 use smithay::wayland::xdg_activation::XdgActivationToken;
 
-use crate::utils::expand_home;
+use crate::utils::{expand_home, IS_SYSTEMD_SERVICE};
 
 pub static REMOVE_ENV_RUST_BACKTRACE: AtomicBool = AtomicBool::new(false);
 pub static REMOVE_ENV_RUST_LIB_BACKTRACE: AtomicBool = AtomicBool::new(false);
@@ -20,6 +22,16 @@ pub static CHILD_DISPLAY: RwLock<Option<String>> = RwLock::new(None);
 
 static ORIGINAL_NOFILE_RLIMIT_CUR: Atomic<rlim_t> = Atomic::new(0);
 static ORIGINAL_NOFILE_RLIMIT_MAX: Atomic<rlim_t> = Atomic::new(0);
+
+#[derive(Serialize, Deserialize)]
+struct SpawnRequest {
+    program: OsString,
+    args: Vec<OsString>,
+    env: Vec<(OsString, Option<OsString>)>,
+    nofile_soft: rlim_t,
+    nofile_hard: rlim_t,
+    systemd: bool,
+}
 
 /// Increases the nofile rlimit to the maximum and stores the original value.
 pub fn store_and_increase_nofile_rlimit() {
@@ -113,11 +125,7 @@ fn spawn_sync(
     }
 
     let mut process = Command::new(command);
-    process
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    process.args(args);
 
     // Remove RUST_BACKTRACE and RUST_LIB_BACKTRACE from the environment if needed.
     if REMOVE_ENV_RUST_BACKTRACE.load(Ordering::Relaxed) {
@@ -154,12 +162,85 @@ fn spawn_sync(
         process.env("DESKTOP_STARTUP_ID", token.as_str());
     }
 
-    unsafe { process.pre_exec(crate::utils::signals::unblock_all) };
-
-    let Some(mut child) = do_spawn(command, process) else {
-        return;
+    // Child environment overrides must not affect the helper's loader or systemd connection.
+    let request = SpawnRequest {
+        program: process.get_program().to_owned(),
+        args: process.get_args().map(OsStr::to_owned).collect(),
+        env: process
+            .get_envs()
+            .map(|(key, value)| (key.to_owned(), value.map(OsStr::to_owned)))
+            .collect(),
+        nofile_soft: ORIGINAL_NOFILE_RLIMIT_CUR.load(Ordering::Relaxed),
+        nofile_hard: ORIGINAL_NOFILE_RLIMIT_MAX.load(Ordering::Relaxed),
+        systemd: IS_SYSTEMD_SERVICE.load(Ordering::Relaxed),
+    };
+    let request = match serde_json::to_vec(&request) {
+        Ok(request) => request,
+        Err(err) => {
+            warn!("error encoding command for spawn helper: {err:?}");
+            return;
+        }
     };
 
+    // Keep working after the running executable has been replaced during an upgrade.
+    #[cfg(target_os = "linux")]
+    let executable = Path::new("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(err) => {
+            warn!("error finding niri executable: {err:?}");
+            return;
+        }
+    };
+
+    // pre_exec forces Command to fork, which can stall a GPU-loaded compositor.
+    // Re-exec first so that double-forking and child setup happen without a GPU context.
+    match Command::new(executable)
+        .arg("spawn")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .spawn()
+    {
+        Ok(mut child) => {
+            if let Err(err) = child.stdin.take().unwrap().write_all(&request) {
+                warn!("error sending command to spawn helper: {err:?}");
+            }
+            wait_for_child(child);
+        }
+        Err(err) => warn!("error spawning {command:?}: {err:?}"),
+    }
+}
+
+pub fn spawn_child() -> anyhow::Result<()> {
+    let request: SpawnRequest = serde_json::from_reader(io::stdin().lock())?;
+    crate::utils::signals::unblock_all()?;
+    ORIGINAL_NOFILE_RLIMIT_CUR.store(request.nofile_soft, Ordering::Relaxed);
+    ORIGINAL_NOFILE_RLIMIT_MAX.store(request.nofile_hard, Ordering::Relaxed);
+    IS_SYSTEMD_SERVICE.store(request.systemd, Ordering::Relaxed);
+
+    let mut process = Command::new(&request.program);
+    process
+        .args(request.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+
+    for (key, value) in request.env {
+        if let Some(value) = value {
+            process.env(key, value);
+        } else {
+            process.env_remove(key);
+        }
+    }
+
+    if let Some(child) = do_spawn(&request.program, process) {
+        wait_for_child(child);
+    }
+    Ok(())
+}
+
+fn wait_for_child(mut child: Child) {
     match child.wait() {
         Ok(status) => {
             if !status.success() {
