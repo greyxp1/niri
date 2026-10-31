@@ -1,0 +1,44 @@
+name: Cache Niri
+
+on:
+  push:
+    branches: [personal]
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cache-niri
+  cancel-in-progress: true
+
+jobs:
+  cache:
+    if: github.repository == 'greyxp1/niri' && github.ref == 'refs/heads/personal'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jlumbroso/free-disk-space@v1.3.1
+        with:
+          dotnet: false
+          large-packages: false
+
+      - uses: cachix/install-nix-action@3dc140bfc76c49fbd4dd958429132e3746bcb086 # v31.11.5
+
+      - uses: cachix/cachix-action@38b082610b782e7e93e209c35fd730d399dee866 # v17
+        with:
+          name: ${{ vars.CACHIX_CACHE_NAME }}
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          skipPush: true
+
+      - name: Build Niri
+        run: nix build .#niri --no-update-lock-file --print-build-logs --cores 2 --max-jobs 1
+      - name: Upload Niri
+        env:
+          CACHIX_CACHE_NAME: ${{ vars.CACHIX_CACHE_NAME }}
+        run: cachix push "$CACHIX_CACHE_NAME" ./result
