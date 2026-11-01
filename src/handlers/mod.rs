@@ -8,7 +8,7 @@ mod xdg_shell;
 use std::fs::File;
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -108,6 +108,9 @@ impl SeatHandler for State {
     fn focus_changed(&mut self, seat: &Seat<Self>, focused: Option<&WlSurface>) {
         let dh = &self.niri.display_handle;
         let client = focused.and_then(|s| dh.get_client(s.id()).ok());
+        self.niri
+            .agent_input
+            .real_keyboard_focus_changed(client.as_ref().map(|c| c.id()));
         set_data_device_focus(dh, seat, client.clone());
         set_primary_focus(dh, seat, client);
     }
@@ -497,6 +500,7 @@ impl SecurityContextHandler for State {
                     client,
                     restricted: true,
                     credentials_unknown: false,
+                    agent_launch: None,
                 });
             })
             .unwrap();
@@ -729,7 +733,10 @@ impl GammaControlHandler for State {
     }
 }
 
-struct UrgentOnlyMarker;
+pub(crate) enum UrgentOnlyMarker {
+    Client,
+    Agent,
+}
 
 impl XdgActivationHandler for State {
     fn activation_state(&mut self) -> &mut XdgActivationState {
@@ -742,12 +749,20 @@ impl XdgActivationHandler for State {
         //
         // See also: https://gitlab.freedesktop.org/wayland/wayland-protocols/-/issues/150
         let Some((serial, seat)) = data.serial else {
-            data.user_data.insert_if_missing(|| UrgentOnlyMarker);
+            data.user_data
+                .insert_if_missing(|| UrgentOnlyMarker::Client);
             return true;
         };
         let Some(seat) = Seat::<State>::from_resource(&seat) else {
             return false;
         };
+
+        // A serial from agent input: allow at most urgency, never a focus change.
+        if self.niri.agent_input.issued(serial) {
+            debug!("downgrading xdg-activation token with an agent input serial to urgency");
+            data.user_data.insert_if_missing(|| UrgentOnlyMarker::Agent);
+            return true;
+        }
 
         // Widely-used clients such as Discord and Telegram make new tokens (with invalid serials)
         // upon clicking on their tray icon or on their notification. This debug flag makes that
@@ -783,17 +798,55 @@ impl XdgActivationHandler for State {
         surface: WlSurface,
     ) {
         if token_data.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT {
+            if let Some(launch) = token_data
+                .user_data
+                .get::<Arc<crate::agent_input::AgentWorkspaceLaunch>>()
+            {
+                let window = self
+                    .niri
+                    .layout
+                    .find_window_and_output(&surface)
+                    .map(|(w, _)| w.id().get());
+                if window.is_none_or(|id| !launch.existing.contains(&id)) {
+                    with_states(&surface, |states| {
+                        *states
+                            .data_map
+                            .get_or_insert_threadsafe(|| Mutex::new(launch.clone()))
+                            .lock()
+                            .unwrap() = launch.clone();
+                    });
+                }
+                if let Some(id) = window.filter(|id| !launch.existing.contains(id)) {
+                    self.do_action(
+                        niri_config::Action::MoveWindowToWorkspaceById {
+                            window_id: id,
+                            reference: niri_ipc::WorkspaceReferenceArg::Id(
+                                launch.workspace_id.get(),
+                            )
+                            .into(),
+                            focus: false,
+                        },
+                        false,
+                    );
+                }
+            }
             if let Some((mapped, _)) = self.niri.layout.find_window_and_output_mut(&surface) {
                 let window = mapped.window.clone();
+                let agent = matches!(
+                    token_data.user_data.get::<UrgentOnlyMarker>(),
+                    Some(UrgentOnlyMarker::Agent)
+                );
                 match mapped.rules().on_xdg_activate {
                     Some(niri_config::OnXdgActivate::Ignore) => {}
-                    Some(niri_config::OnXdgActivate::SetUrgent) => {
-                        mapped.set_urgent(true);
-                        self.niri.queue_redraw_all();
-                    }
-                    Some(niri_config::OnXdgActivate::Focus) => {
+                    Some(niri_config::OnXdgActivate::Focus) if !agent => {
                         self.niri.layout.activate_window(&window);
                         self.niri.layer_shell_on_demand_focus = None;
+                        self.niri.queue_redraw_all();
+                    }
+                    Some(
+                        niri_config::OnXdgActivate::SetUrgent | niri_config::OnXdgActivate::Focus,
+                    ) => {
+                        mapped.set_urgent(true);
                         self.niri.queue_redraw_all();
                     }
                     None => {

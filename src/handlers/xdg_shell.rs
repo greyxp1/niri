@@ -330,6 +330,21 @@ impl XdgShellHandler for State {
             return;
         };
 
+        // A popup opened by agent input (menu, select dropdown, ...). Keep it mapped but don't
+        // take a seat grab, which would steal the user's pointer and keyboard. Agent input
+        // routes keys to it and dismisses it on clicks elsewhere.
+        // A suppressed layer stays in the background even after its input serial is pruned.
+        let suppressed = self
+            .niri
+            .mapped_layer_surfaces
+            .iter()
+            .any(|(layer, mapped)| layer.wl_surface() == &root && mapped.agent_focus_suppressed);
+        if (self.niri.agent_input.issued(serial) || suppressed) && !self.niri.is_locked() {
+            trace!("mapping agent popup without a seat grab");
+            self.niri.agent_input.add_popup(popup);
+            return;
+        }
+
         // We need to hand out the grab in a way consistent with what update_keyboard_focus()
         // thinks the current focus is, otherwise it will desync and cause weird issues with
         // keyboard focus being at the wrong place.
@@ -1079,17 +1094,37 @@ impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
+        let client_workspace = self.niri.agent_workspace_for_client(toplevel.wl_surface());
         let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
         };
 
         let config = self.niri.config.borrow();
-        let rules = ResolvedWindowRules::compute(
+        let mut rules = ResolvedWindowRules::compute(
             &config.window_rules,
             WindowRef::Unmapped(unmapped),
             self.niri.is_at_startup,
         );
+
+        let workspace = unmapped
+            .activation_token_data
+            .as_ref()
+            .and_then(|token| {
+                token
+                    .user_data
+                    .get::<std::sync::Arc<crate::agent_input::AgentWorkspaceLaunch>>()
+            })
+            .map(|launch| launch.workspace_id)
+            .or(client_workspace);
+        if let Some(id) = workspace {
+            rules.open_on_workspace = self
+                .niri
+                .layout
+                .find_workspace_by_id(id)
+                .and_then(|(_, workspace)| workspace.name().cloned());
+            rules.open_focused = Some(false);
+        }
 
         let Unmapped { window, state, .. } = unmapped;
 
@@ -1103,10 +1138,20 @@ impl State {
         };
 
         // Pick the target monitor. First, check if we had a workspace set in the window rules.
-        let mon = rules
-            .open_on_workspace
-            .as_deref()
-            .and_then(|name| self.niri.layout.monitor_for_workspace(name));
+        let mon = workspace
+            .and_then(|id| {
+                self.niri
+                    .layout
+                    .workspaces()
+                    .find(|(_, _, ws)| ws.id() == id)
+            })
+            .and_then(|(monitor, _, _)| monitor)
+            .or_else(|| {
+                rules
+                    .open_on_workspace
+                    .as_deref()
+                    .and_then(|name| self.niri.layout.monitor_for_workspace(name))
+            });
 
         // If not, check if we had an output set in the window rules.
         let mon = mon.or_else(|| {
@@ -1164,11 +1209,15 @@ impl State {
         let is_floating = rules.compute_open_floating(toplevel);
 
         // Tell the surface the preferred size and bounds for its likely output.
-        let ws = rules
-            .open_on_workspace
-            .as_deref()
-            .and_then(|name| mon.map(|mon| mon.find_named_workspace(name)))
-            .unwrap_or_else(|| {
+        let ws = workspace
+            .and_then(|id| self.niri.layout.find_workspace_by_id(id).map(|(_, ws)| ws))
+            .or_else(|| {
+                rules
+                    .open_on_workspace
+                    .as_deref()
+                    .and_then(|name| mon.and_then(|mon| mon.find_named_workspace(name)))
+            })
+            .or_else(|| {
                 mon.map(|mon| mon.active_workspace_ref())
                     .or_else(|| self.niri.layout.active_workspace())
             });

@@ -26,6 +26,9 @@ pub struct Cli {
     /// on a TTY as your non-main compositor instance, to avoid messing up the global environment.
     #[arg(long)]
     pub session: bool,
+    /// Run without a display server or physical outputs, with one virtual output.
+    #[arg(long, value_name = "WIDTHxHEIGHT", conflicts_with = "session")]
+    pub headless: Option<HeadlessSize>,
     /// Command to run upon compositor startup.
     #[arg(last = true)]
     pub command: Vec<OsString>,
@@ -36,6 +39,23 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Sub {
+    /// Expose background computer-use tools over MCP stdio.
+    Mcp {
+        /// Isolate applications in a private Wayland session with a temporary home and writable
+        /// cwd.
+        #[arg(long, conflicts_with = "desktop")]
+        isolated: bool,
+        /// Use a thread workspace, or NAME to share one.
+        #[arg(long, num_args = 0..=1, default_missing_value = "", conflicts_with_all = ["isolated", "headless", "desktop"], value_name = "NAME")]
+        workspace: Option<String>,
+        /// Connect to your desktop, importing missing session variables from systemd.
+        #[arg(long, conflicts_with = "headless")]
+        desktop: bool,
+        /// Start a private compositor and D-Bus session (default with --isolated: 1280x800).
+        /// Without --isolated, this does not isolate application files.
+        #[arg(long, value_name = "WIDTHxHEIGHT")]
+        headless: Option<HeadlessSize>,
+    },
     /// Communicate with the running niri instance.
     Msg {
         #[command(subcommand)]
@@ -60,6 +80,27 @@ pub enum Sub {
     Panic,
     /// Generate shell completions.
     Completions { shell: CompletionShell },
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct HeadlessSize(pub u16, pub u16);
+
+impl std::str::FromStr for HeadlessSize {
+    type Err = &'static str;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        let invalid = "expected WIDTHxHEIGHT, each between 1 and 8192, at most 32 megapixels";
+        let (width, height) = value.split_once('x').ok_or(invalid)?;
+        let width: u16 = width.parse().map_err(|_| invalid)?;
+        let height: u16 = height.parse().map_err(|_| invalid)?;
+        if !(1..=8192).contains(&width)
+            || !(1..=8192).contains(&height)
+            || u32::from(width) * u32::from(height) > 32 * 1024 * 1024
+        {
+            return Err(invalid);
+        }
+        Ok(Self(width, height))
+    }
 }
 
 #[derive(Subcommand)]

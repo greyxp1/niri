@@ -22,6 +22,7 @@ use smithay::wayland::shell::xdg::{
 use wayland_backend::server::Credentials;
 
 use super::{ResolvedWindowRules, WindowRef};
+use crate::agent_input::AgentCursor;
 use crate::handlers::KdeDecorationsModeState;
 use crate::layout::{
     ConfigureIntent, InteractiveResizeData, LayoutElement, LayoutElementRenderElement,
@@ -99,6 +100,12 @@ pub struct Mapped {
 
     /// Whether this window is a target of a window cast.
     is_window_cast_target: bool,
+
+    /// Whether this window recently received computer-use agent input or screenshots.
+    is_agent_driven: bool,
+
+    /// The agent's pointer indicator.
+    agent_cursor: Option<AgentCursor>,
 
     /// Whether this window should ignore opacity set through window rules.
     ignore_opacity_window_rule: bool,
@@ -290,6 +297,8 @@ impl Mapped {
             is_active_in_column: true,
             is_floating: false,
             is_window_cast_target: false,
+            is_agent_driven: false,
+            agent_cursor: None,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),
             blur_config: config.blur,
@@ -383,6 +392,10 @@ impl Mapped {
         self.is_window_cast_target
     }
 
+    pub fn is_agent_driven(&self) -> bool {
+        self.is_agent_driven
+    }
+
     pub fn toggle_ignore_opacity_window_rule(&mut self) {
         self.ignore_opacity_window_rule = !self.ignore_opacity_window_rule;
     }
@@ -404,6 +417,25 @@ impl Mapped {
 
         self.is_window_cast_target = value;
         self.need_to_recompute_rules = true;
+    }
+
+    pub fn set_is_agent_driven(&mut self, value: bool) {
+        if self.is_agent_driven == value {
+            return;
+        }
+
+        self.is_agent_driven = value;
+        self.need_to_recompute_rules = true;
+    }
+
+    /// Returns whether the cursor changed.
+    pub fn set_agent_cursor(&mut self, cursor: Option<AgentCursor>) -> bool {
+        if self.agent_cursor == cursor {
+            return false;
+        }
+
+        self.agent_cursor = cursor;
+        true
     }
 
     /// Renders a snapshot of the window without popups.
@@ -980,6 +1012,10 @@ impl LayoutElement for Mapped {
 
     fn is_urgent(&self) -> bool {
         self.is_urgent
+    }
+
+    fn agent_cursor(&self) -> Option<AgentCursor> {
+        self.agent_cursor
     }
 
     fn set_activated(&mut self, active: bool) {

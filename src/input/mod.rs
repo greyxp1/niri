@@ -522,7 +522,6 @@ impl State {
             |this, mods, keysym| {
                 let key_code = keysym.raw_code();
                 let modifiers = modifiers_from_state(*mods);
-
                 // When resolving a bind, we can try three keysyms:
                 // - modified: the actual final keysym we got by pressing this key
                 // - raw: keysym from the 0th layer of the current layout (usually lowercase letter)
@@ -4523,7 +4522,7 @@ impl State {
 
         let serial = SERIAL_COUNTER.next_serial();
 
-        let under = self.niri.contents_under(pos);
+        let under = self.niri.contents_under_without_agent_hold(pos);
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();

@@ -246,6 +246,11 @@ pub trait LayoutElement {
 
     fn is_urgent(&self) -> bool;
 
+    /// The computer-use agent's pointer, rendered as an indicator on the tile.
+    fn agent_cursor(&self) -> Option<crate::agent_input::AgentCursor> {
+        None
+    }
+
     fn configure_intent(&self) -> ConfigureIntent;
     fn send_pending_configure(&mut self);
 
@@ -767,7 +772,7 @@ impl<W: LayoutElement> Layout<W> {
                 let new_output_idx = monitors.len();
                 let mut workspaces = vec![];
                 for source_idx in 0..monitors.len() {
-                    let mut stopped_ws_switch = false;
+                    let mut removed_workspaces = false;
 
                     for i in (0..monitors[source_idx].workspaces.len()).rev() {
                         let preferred = monitors[source_idx].workspaces[i].find_preferred_output(
@@ -782,13 +787,13 @@ impl<W: LayoutElement> Layout<W> {
 
                         let source = &mut monitors[source_idx];
                         let ws = source.workspaces.remove(i);
+                        removed_workspaces = true;
 
                         // FIXME: this can be coded in a way that the workspace switch won't be
                         // affected if the removed workspace is invisible. But this is good enough
                         // for now.
                         if source.workspace_switch.is_some() {
                             source.workspace_switch = None;
-                            stopped_ws_switch = true;
                         }
 
                         // The user could've closed a window while remaining on this workspace, on
@@ -819,11 +824,8 @@ impl<W: LayoutElement> Layout<W> {
 
                     let source = &mut monitors[source_idx];
 
-                    // If we stopped a workspace switch, then we might need to clean up workspaces.
-                    // Also if empty_workspace_above_first is set and there are only 2 workspaces
-                    // left, both will be empty and one of them needs to be removed.
-                    // clean_up_workspaces takes care of this.
-                    if stopped_ws_switch
+                    // A removed agent workspace can leave its personal spare behind.
+                    if removed_workspaces
                         || (source.options.layout.empty_workspace_above_first
                             && source.workspaces.len() == 2)
                     {
@@ -1397,6 +1399,17 @@ impl<W: LayoutElement> Layout<W> {
                         return;
                     }
                 }
+            }
+        }
+    }
+
+    pub fn release_agent_workspace(&mut self, id: WorkspaceId) {
+        if let Some(ws) = self.workspaces_mut().find(|ws| ws.id() == id) {
+            ws.is_agent = false;
+        }
+        for monitor in self.monitors_mut().filter(|monitor| monitor.has_ws(id)) {
+            if monitor.workspace_switch.is_none() {
+                monitor.clean_up_workspaces();
             }
         }
     }
@@ -2947,6 +2960,14 @@ impl<W: LayoutElement> Layout<W> {
     }
 
     pub fn ensure_named_workspace(&mut self, ws_config: &WorkspaceConfig) {
+        self.ensure_named_workspace_at(ws_config, false);
+    }
+
+    pub fn ensure_named_workspace_at_bottom(&mut self, ws_config: &WorkspaceConfig) {
+        self.ensure_named_workspace_at(ws_config, true);
+    }
+
+    fn ensure_named_workspace_at(&mut self, ws_config: &WorkspaceConfig, at_bottom: bool) {
         if self.find_workspace_by_name(&ws_config.name.0).is_some() {
             return;
         }
@@ -2975,18 +2996,37 @@ impl<W: LayoutElement> Layout<W> {
                 };
                 let mon = &mut monitors[mon_idx];
 
-                let ws = Workspace::new_with_config(
+                let mut ws = Workspace::new_with_config(
                     mon.output.clone(),
                     Some(ws_config.clone()),
                     clock,
                     options,
                 );
-                mon.insert_workspace(ws, 0, false);
+                ws.is_agent = at_bottom;
+                if at_bottom && !mon.workspaces.iter().any(|ws| ws.is_agent) {
+                    ws.update_config(mon.options.clone());
+                    mon.workspaces.push(ws);
+                    mon.add_workspace_bottom();
+                    mon.workspace_switch = None;
+                    mon.clean_up_workspaces();
+                } else {
+                    let index = if at_bottom {
+                        mon.workspaces.len() - 1
+                    } else {
+                        0
+                    };
+                    mon.insert_workspace(ws, index, false);
+                }
             }
             MonitorSet::NoOutputs { workspaces } => {
-                let ws =
+                let mut ws =
                     Workspace::new_with_config_no_outputs(Some(ws_config.clone()), clock, options);
-                workspaces.insert(0, ws);
+                ws.is_agent = at_bottom;
+                if at_bottom {
+                    workspaces.push(ws);
+                } else {
+                    workspaces.insert(0, ws);
+                }
             }
         }
     }
@@ -4589,13 +4629,7 @@ impl<W: LayoutElement> Layout<W> {
         // Conversely, if `ws` was the last workspace on a monitor, an
         // empty workspace needs to be added after.
 
-        if let MonitorSet::Normal {
-            monitors,
-            active_monitor_idx,
-            ..
-        } = &mut self.monitor_set
-        {
-            let monitor = &mut monitors[*active_monitor_idx];
+        if let Some(monitor) = self.monitors_mut().find(|monitor| monitor.has_ws(wsid)) {
             if monitor.options.layout.empty_workspace_above_first
                 && monitor
                     .workspaces
@@ -4611,6 +4645,7 @@ impl<W: LayoutElement> Layout<W> {
             {
                 monitor.add_workspace_bottom();
             }
+            monitor.ensure_agent_workspace_gap();
         }
     }
 

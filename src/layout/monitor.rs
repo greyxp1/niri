@@ -307,6 +307,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         // Prepare the workspaces: set output, empty first, empty last.
         let mut active_workspace_idx = 0;
+        workspaces.sort_by_key(|ws| ws.is_agent);
 
         for (idx, ws) in workspaces.iter_mut().enumerate() {
             assert!(ws.has_windows_or_name());
@@ -328,7 +329,7 @@ impl<W: LayoutElement> Monitor<W> {
         let ws = Workspace::new(output.clone(), clock.clone(), options.clone());
         workspaces.push(ws);
 
-        Self {
+        let mut monitor = Self {
             output_name: output.name(),
             output,
             scale,
@@ -347,7 +348,9 @@ impl<W: LayoutElement> Monitor<W> {
             base_options,
             options,
             layout_config,
-        }
+        };
+        monitor.ensure_agent_workspace_gap();
+        monitor
     }
 
     pub fn into_workspaces(mut self) -> Vec<Workspace<W>> {
@@ -568,6 +571,12 @@ impl<W: LayoutElement> Monitor<W> {
             workspace_idx += 1;
         }
 
+        if let Some(index) = self.ensure_agent_workspace_gap() {
+            if index <= workspace_idx {
+                workspace_idx += 1;
+            }
+        }
+
         if activate {
             self.activate_workspace(workspace_idx);
         }
@@ -615,6 +624,12 @@ impl<W: LayoutElement> Monitor<W> {
             workspace_idx += 1;
         }
 
+        if let Some(index) = self.ensure_agent_workspace_gap() {
+            if index <= workspace_idx {
+                workspace_idx += 1;
+            }
+        }
+
         if allow_to_activate_workspace && activate.map_smart(|| false) {
             self.activate_workspace(workspace_idx);
         }
@@ -647,8 +662,18 @@ impl<W: LayoutElement> Monitor<W> {
         }
     }
 
+    pub(super) fn ensure_agent_workspace_gap(&mut self) -> Option<usize> {
+        let index = self.workspaces.iter().position(|ws| ws.is_agent)?;
+        if index > 0 && !self.workspaces[index - 1].has_windows_or_name() {
+            return None;
+        }
+        self.add_workspace_at(index);
+        Some(index)
+    }
+
     pub fn clean_up_workspaces(&mut self) {
         assert!(self.workspace_switch.is_none());
+        self.ensure_agent_workspace_gap();
 
         let range_start = if self.options.layout.empty_workspace_above_first {
             1
@@ -657,6 +682,9 @@ impl<W: LayoutElement> Monitor<W> {
         };
         for idx in (range_start..self.workspaces.len() - 1).rev() {
             if self.active_workspace_idx == idx {
+                continue;
+            }
+            if !self.workspaces[idx].is_agent && self.workspaces[idx + 1].is_agent {
                 continue;
             }
 
@@ -757,12 +785,13 @@ impl<W: LayoutElement> Monitor<W> {
             ws.update_config(self.options.clone());
         }
 
-        let empty_was_focused = self.active_workspace_idx == self.workspaces.len() - 1;
+        let active_workspace_id = self.workspaces[self.active_workspace_idx].id();
 
         // Push the workspaces from the removed monitor in the end, right before the
         // last, empty, workspace.
         let empty = self.workspaces.remove(self.workspaces.len() - 1);
         self.workspaces.extend(workspaces);
+        self.workspaces.sort_by_key(|ws| ws.is_agent);
         self.workspaces.push(empty);
 
         // If empty_workspace_above_first is set and the first workspace is now no longer empty,
@@ -773,10 +802,7 @@ impl<W: LayoutElement> Monitor<W> {
             self.add_workspace_top();
         }
 
-        // If the empty workspace was focused on the primary monitor, keep it focused.
-        if empty_was_focused {
-            self.active_workspace_idx = self.workspaces.len() - 1;
-        }
+        self.active_workspace_idx = self.idx_of_ws(active_workspace_id).unwrap();
 
         // FIXME: if we're adding workspaces to currently invisible positions
         // (outside the workspace switch), we don't need to cancel it.
@@ -1209,6 +1235,7 @@ impl<W: LayoutElement> Monitor<W> {
 
         self.base_options = base_options;
         self.options = options;
+        self.ensure_agent_workspace_gap();
     }
 
     pub fn update_layout_config(&mut self, layout_config: Option<niri_config::LayoutPart>) -> bool {
@@ -2191,7 +2218,9 @@ impl<W: LayoutElement> Monitor<W> {
                 // skip last
                 .skip(1)
             {
-                if idx != self.active_workspace_idx {
+                if idx != self.active_workspace_idx
+                    && !(!ws.is_agent && self.workspaces[idx + 1].is_agent)
+                {
                     assert!(
                         ws.has_windows_or_name(),
                         "non-active workspace can't be empty and unnamed except the last one"
