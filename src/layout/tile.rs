@@ -1116,6 +1116,15 @@ impl<W: LayoutElement> Tile<W> {
             .geometry_corner_radius()
             .scaled_by(1. - expanded_progress as f32);
 
+        // The computer-use agent pointer goes above everything, including popups.
+        if let Some(cursor) = self.window.agent_cursor() {
+            if BorderRenderElement::has_shader(ctx.renderer) {
+                cursor.render(window_render_loc, scale.x as f32, &mut |elem| {
+                    push(elem.into())
+                });
+            }
+        }
+
         // Popups go on top, whether it's resize or not.
         self.window.render_popups(
             ctx.r(),

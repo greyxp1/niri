@@ -19,9 +19,14 @@ use crate::render_helpers::surface::push_elements_from_surface_tree;
 use crate::render_helpers::xray::XrayPos;
 use crate::render_helpers::{background_effect, RenderCtx};
 use crate::utils::{baba_is_float_offset, round_logical_in_physical};
+use crate::window::mapped::MappedId;
 
 #[derive(Debug)]
 pub struct MappedLayer {
+    id: MappedId,
+    agent_cursor: Option<crate::agent_input::AgentCursor>,
+    /// Agent-driven layers acquire the real keyboard only after explicit user interaction.
+    pub agent_focus_suppressed: bool,
     /// The surface itself.
     surface: LayerSurface,
 
@@ -61,6 +66,7 @@ niri_render_elements! {
         SolidColor = SolidColorRenderElement,
         Shadow = ShadowRenderElement,
         BackgroundEffect = BackgroundEffectElement,
+        AgentCursor = crate::render_helpers::border::BorderRenderElement,
     }
 }
 
@@ -80,6 +86,9 @@ impl MappedLayer {
         shadow_config.merge_with(&rules.shadow);
 
         Self {
+            id: MappedId::next(),
+            agent_cursor: None,
+            agent_focus_suppressed: false,
             surface,
             pre_commit_hook,
             rules,
@@ -132,6 +141,18 @@ impl MappedLayer {
 
     pub fn surface(&self) -> &LayerSurface {
         &self.surface
+    }
+
+    pub fn id(&self) -> MappedId {
+        self.id
+    }
+
+    pub fn set_agent_cursor(&mut self, cursor: Option<crate::agent_input::AgentCursor>) -> bool {
+        if self.agent_cursor == cursor {
+            return false;
+        }
+        self.agent_cursor = cursor;
+        true
     }
 
     pub fn rules(&self) -> &ResolvedLayerRules {
@@ -273,6 +294,15 @@ impl MappedLayer {
         let bob_offset = self.bob_offset();
         let location = location + bob_offset;
         let xray_pos = xray_pos.offset(bob_offset);
+
+        if let Some(cursor) = self
+            .agent_cursor
+            .filter(|_| ctx.target != crate::render_helpers::RenderTarget::ScreenCapture)
+        {
+            if crate::render_helpers::border::BorderRenderElement::has_shader(ctx.renderer) {
+                cursor.render(location, self.scale as f32, &mut |elem| push(elem.into()));
+            }
+        }
 
         let surface = self.surface.wl_surface();
         for (popup, offset) in PopupManager::popups_for_surface(surface) {

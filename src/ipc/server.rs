@@ -1,10 +1,11 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use std::{env, io, process};
 
 use anyhow::Context;
@@ -12,19 +13,20 @@ use async_channel::{Receiver, Sender, TrySendError};
 use calloop::futures::Scheduler;
 use calloop::io::Async;
 use directories::BaseDirs;
-use futures_util::io::BufReader;
+use futures_util::io::{AsyncReadExt, BufReader};
 use futures_util::{select_biased, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, FutureExt as _};
 use niri_config::OutputName;
 use niri_ipc::state::{EventStreamState, EventStreamStatePart as _};
 use niri_ipc::{
-    Action, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply, Request, Response,
-    Screenshot, ScreenshotRequest, Timestamp, WindowLayout, Workspace,
+    Action, AgentActivityKind, Event, KeyboardLayouts, OutputConfigChanged, Overview, Reply,
+    Request, Response, Screenshot, ScreenshotRequest, Timestamp, WindowLayout, Workspace,
 };
 use smithay::desktop::layer_map_for_output;
 use smithay::input::pointer::{
     CursorIcon, CursorImageStatus, Focus, GrabStartData as PointerGrabStartData,
 };
 use smithay::reexports::calloop::generic::Generic;
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::rustix::fs::unlink;
 use smithay::utils::SERIAL_COUNTER;
@@ -52,11 +54,37 @@ pub struct IpcServer {
 }
 
 struct ClientCtx {
+    owner: u64,
+    alive: Rc<Cell<bool>>,
     event_loop: LoopHandle<'static, State>,
     scheduler: Scheduler<()>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
+    agent_session: bool,
+    agent_workspace: Option<String>,
+}
+
+impl Drop for ClientCtx {
+    fn drop(&mut self) {
+        self.alive.set(false);
+        let owner = self.owner;
+        self.event_loop
+            .insert_idle(move |state| state.agent_disconnect(owner));
+        if let Some(name) = self.agent_workspace.take() {
+            self.event_loop.insert_idle(move |state| {
+                let _ = state.niri.agent_workspace_changed(name, false, owner);
+                state.niri.queue_redraw_all();
+            });
+        }
+        if self.agent_session {
+            self.event_loop.insert_idle(|state| {
+                if state.niri.agent_indicator.session_changed(false) {
+                    state.niri.queue_redraw_all();
+                }
+            });
+        }
+    }
 }
 
 struct EventStreamClient {
@@ -168,11 +196,15 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
     let ipc_server = state.niri.ipc_server.as_ref().unwrap();
 
     let ctx = ClientCtx {
+        owner: fastrand::u64(..),
+        alive: Rc::new(Cell::new(true)),
         event_loop: state.niri.event_loop.clone(),
         scheduler: state.niri.scheduler.clone(),
         ipc_outputs: state.backend.ipc_outputs(),
         event_streams: ipc_server.event_streams.clone(),
         event_stream_state: ipc_server.event_stream_state.clone(),
+        agent_session: false,
+        agent_workspace: None,
     };
 
     let future = async move {
@@ -185,7 +217,10 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
     }
 }
 
-async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> anyhow::Result<()> {
+async fn handle_client(
+    mut ctx: ClientCtx,
+    stream: Async<'static, UnixStream>,
+) -> anyhow::Result<()> {
     let mut read = BufReader::new(stream);
 
     loop {
@@ -210,8 +245,36 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
         }
         let requested_error = matches!(request, Ok(Request::ReturnError));
         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+        let requested_agent_session = matches!(
+            request,
+            Ok(Request::AgentSession | Request::AgentWorkspace { .. })
+        );
+        if requested_agent_session {
+            anyhow::ensure!(
+                ctx.agent_workspace.is_none() && !ctx.agent_session,
+                "agent session already registered"
+            );
+        }
+        if let Ok(Request::AgentWorkspace { workspace }) = &request {
+            ctx.agent_workspace = Some(workspace.clone());
+        }
+        if matches!(request, Ok(Request::AgentSession)) {
+            ctx.agent_session = true;
+            ctx.event_loop.insert_idle(|state| {
+                if state.niri.agent_indicator.session_changed(true) {
+                    state.niri.queue_redraw_all();
+                }
+            });
+        }
 
         let reply = match request {
+            Ok(request) if ctx.agent_session || ctx.agent_workspace.is_some() => {
+                let mut disconnected = [0];
+                select_biased! {
+                    result = process(&ctx, request).fuse() => result,
+                    _ = read.read(&mut disconnected).fuse() => return Ok(()),
+                }
+            }
             Ok(request) => process(&ctx, request).await,
             Err(err) => Err(err),
         };
@@ -299,7 +362,14 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                 let mut layers = Vec::new();
                 for output in state.niri.global_space.outputs() {
                     let name = output.name();
-                    for surface in layer_map_for_output(output).layers() {
+                    let map = layer_map_for_output(output);
+                    for surface in map.layers() {
+                        let Some(mapped) = state.niri.mapped_layer_surfaces.get(surface) else {
+                            continue;
+                        };
+                        let Some(geometry) = map.layer_geometry(surface) else {
+                            continue;
+                        };
                         let layer = match surface.layer() {
                             Layer::Background => niri_ipc::Layer::Background,
                             Layer::Bottom => niri_ipc::Layer::Bottom,
@@ -320,6 +390,15 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                             };
 
                         layers.push(niri_ipc::LayerSurface {
+                            id: mapped.id().get(),
+                            pid: crate::utils::get_credentials_for_surface(surface.wl_surface())
+                                .map(|c| c.pid),
+                            geometry: (
+                                geometry.loc.x,
+                                geometry.loc.y,
+                                geometry.size.w,
+                                geometry.size.h,
+                            ),
                             namespace: surface.namespace().to_owned(),
                             output: name.clone(),
                             layer,
@@ -451,7 +530,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let output = result.map_err(|_| String::from("error getting active output info"))?;
             Response::FocusedOutput(output)
         }
-        Request::EventStream => Response::Handled,
+        Request::EventStream | Request::AgentSession => Response::Handled,
         Request::OverviewState => {
             let state = ctx.event_stream_state.borrow();
             let is_open = state.overview.is_open;
@@ -461,6 +540,246 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let state = ctx.event_stream_state.borrow();
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
+        }
+        Request::AgentWorkspace { ref workspace }
+        | Request::AgentWorkspaceStatus { ref workspace } => {
+            let workspace = workspace.clone();
+            let connect = matches!(request, Request::AgentWorkspace { .. })
+                || ctx
+                    .agent_workspace
+                    .as_ref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&workspace));
+            let owner = ctx.owner;
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let result = if connect {
+                    state.niri.agent_workspace_changed(workspace, true, owner)
+                } else {
+                    state.niri.agent_workspace_status(&workspace, Some(owner))
+                };
+                let _ = tx.send_blocking(result);
+            });
+            Response::AgentWorkspace(
+                rx.recv()
+                    .await
+                    .map_err(|_| "error getting agent workspace".to_owned())??,
+            )
+        }
+        Request::AgentHandoff { ref workspace, .. } | Request::AgentResume { ref workspace } => {
+            let workspace = workspace.clone();
+            let reason = if let Request::AgentHandoff { reason, .. } = request {
+                if reason.trim().is_empty() || reason.chars().count() > 240 {
+                    return Err("handoff reason must contain 1 to 240 characters".into());
+                }
+                Some(reason)
+            } else {
+                None
+            };
+            let (tx, rx) = async_channel::bounded(1);
+            let owner = ctx.owner;
+            let alive = ctx.alive.clone();
+            ctx.event_loop.insert_idle(move |state| {
+                if !alive.get() {
+                    return;
+                }
+                let _ = tx.send_blocking(state.set_agent_workspace_control(
+                    &workspace,
+                    reason.is_some(),
+                    reason,
+                    Some(owner),
+                ));
+            });
+            Response::AgentWorkspace(
+                rx.recv()
+                    .await
+                    .map_err(|_| "error changing workspace control".to_owned())??,
+            )
+        }
+        Request::AgentSpawn { command, workspace } => {
+            if command.first().is_none_or(|program| program.is_empty()) {
+                return Err(String::from("command requires an executable"));
+            }
+            let (tx, rx) = async_channel::bounded(1);
+            let alive = ctx.alive.clone();
+            ctx.event_loop.insert_idle(move |state| {
+                if !alive.get() {
+                    return;
+                }
+                let launch = if let Some(name) = &workspace {
+                    let info = match state.niri.agent_workspace_status(name, None) {
+                        Ok(info) if !info.paused => info,
+                        Ok(_) => {
+                            let _ =
+                                tx.send_blocking(Err("workspace automation is paused".to_owned()));
+                            return;
+                        }
+                        Err(error) => {
+                            let _ = tx.send_blocking(Err(error));
+                            return;
+                        }
+                    };
+                    Some(Arc::new(crate::agent_input::AgentWorkspaceLaunch {
+                        name: name.to_ascii_lowercase(),
+                        workspace_id: WorkspaceId::specific(info.id),
+                        existing: state
+                            .niri
+                            .layout
+                            .windows()
+                            .map(|(_, w)| w.id().get())
+                            .collect(),
+                        created: Instant::now(),
+                    }))
+                } else {
+                    None
+                };
+                let mut marked = vec![String::from("env"), String::from("NIRI_AGENT_LAUNCH=1")];
+                if let Some(launch) = &launch {
+                    match state.niri.agent_launch_display(launch.clone()) {
+                        Ok(display) => {
+                            marked.push(format!("WAYLAND_DISPLAY={}", display.to_string_lossy()));
+                        }
+                        Err(error) => {
+                            let _ = tx.send_blocking(Err(error));
+                            return;
+                        }
+                    }
+                }
+                let (token, data) = state.niri.activation_state.create_external_token(None);
+                if let Some(launch) = &launch {
+                    data.user_data.insert_if_missing(|| launch.clone());
+                }
+                data.user_data
+                    .insert_if_missing(|| crate::handlers::UrgentOnlyMarker::Agent);
+                marked.extend(command);
+                crate::utils::spawning::spawn(marked, Some(token.clone()));
+                let Some(launch) = launch else {
+                    let _ = tx.send_blocking(Ok(Vec::new()));
+                    return;
+                };
+                let error_tx = tx.clone();
+                if let Err(error) = state.niri.event_loop.insert_source(
+                    Timer::from_duration(Duration::ZERO),
+                    move |_, _, state| {
+                        if !alive.get() {
+                            return TimeoutAction::Drop;
+                        }
+                        let result = state.niri.agent_workspace_status(&launch.name, None).and_then(|info| {
+                            if info.paused {
+                                return Err("workspace automation is paused".to_owned());
+                            }
+                            let windows: Vec<_> = state.niri.layout.windows()
+                                .filter(|(_, window)| {
+                                    !launch.existing.contains(&window.id().get())
+                                        && state.niri.agent_launch_for_surface(window.toplevel().wl_surface())
+                                            .is_some_and(|other| Arc::ptr_eq(&other, &launch))
+                                        && state.niri.check_agent_workspace_access(
+                                            window.id().get(), Some(&launch.name)
+                                        ).is_ok()
+                                })
+                                .map(|(_, window)| window.id().get())
+                                .collect();
+                            Ok(windows)
+                        });
+                        if result.as_ref().is_ok_and(Vec::is_empty) {
+                            if launch.created.elapsed() < crate::handlers::XDG_ACTIVATION_TOKEN_TIMEOUT {
+                                return TimeoutAction::ToDuration(Duration::from_millis(25));
+                            }
+                            let _ = tx.send_blocking(Err(format!(
+                                "No new app window was confirmed on workspace {}. The command may have failed or reused an existing window. Inspect existing agent windows before retrying.", launch.name
+                            )));
+                        } else {
+                            let _ = tx.send_blocking(result);
+                        }
+                        TimeoutAction::Drop
+                    },
+                ) {
+                    let _ = error_tx.send_blocking(Err(error.to_string()));
+                }
+            });
+            let windows = rx
+                .recv()
+                .await
+                .map_err(|_| "error launching application".to_owned())??;
+            if windows.is_empty() {
+                Response::Handled
+            } else {
+                Response::AgentSpawn(windows)
+            }
+        }
+        Request::AgentInput {
+            window_id,
+            workspace,
+            geometry,
+            events,
+        } => {
+            let (tx, rx) = async_channel::bounded(1);
+            let owner = ctx.owner;
+            let alive = ctx.alive.clone();
+            ctx.event_loop.insert_idle(move |state| {
+                if !alive.get() {
+                    return;
+                }
+                let cleanup = crate::agent_input::is_agent_cleanup(&events);
+                let result = if cleanup {
+                    Ok(())
+                } else {
+                    state
+                        .niri
+                        .check_agent_workspace_access(window_id, workspace.as_deref())
+                }
+                .and_then(|()| {
+                    if let Some(expected) = geometry {
+                        if state.agent_geometry(window_id)? != expected {
+                            return Err("window geometry changed, take another screenshot".into());
+                        }
+                    }
+                    state.agent_input(owner, window_id, events)
+                });
+                if result.is_err() {
+                    state.agent_release_input(owner);
+                }
+                let _ = tx.send_blocking(result);
+            });
+            let result = rx.recv().await;
+            result.map_err(|_| String::from("error delivering agent input"))??;
+            Response::Handled
+        }
+        Request::AgentScreenshot {
+            window_id,
+            workspace,
+            path,
+            show_pointer,
+        } => {
+            if !Path::new(&path).is_absolute() {
+                return Err(format!("path must be absolute: {path}"));
+            }
+            let (tx, rx) = async_channel::bounded(1);
+            let owner = ctx.owner;
+            let alive = ctx.alive.clone();
+            ctx.event_loop.insert_idle(move |state| {
+                if !alive.get() {
+                    return;
+                }
+                let result = state
+                    .niri
+                    .check_agent_workspace_access(window_id, workspace.as_deref())
+                    .and_then(|()| {
+                        state.agent_screenshot(
+                            owner,
+                            workspace,
+                            window_id,
+                            path,
+                            show_pointer,
+                            tx.clone(),
+                        )
+                    });
+                if let Err(err) = result {
+                    let _ = tx.send_blocking(Err(err));
+                }
+            });
+            let result = rx.recv().await;
+            let info = result.map_err(|_| String::from("error taking agent screenshot"))??;
+            Response::AgentScreenshot(info)
         }
     };
 
@@ -1057,6 +1376,15 @@ impl State {
         let event = Event::ConfigLoaded { failed };
         state.apply(event.clone());
         server.send_event(event);
+    }
+
+    pub fn ipc_agent_input_activity(&mut self, window_id: u64, kind: AgentActivityKind) {
+        let Some(server) = &self.niri.ipc_server else {
+            return;
+        };
+
+        // Transient: there's no state to apply.
+        server.send_event(Event::AgentInputActivity { window_id, kind });
     }
 
     pub fn ipc_screenshot_taken(&mut self, path: Option<String>) {

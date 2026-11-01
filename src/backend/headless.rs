@@ -1,32 +1,44 @@
-//! Headless backend for tests.
-//!
-//! This can eventually grow into a more complete backend if needed, but for now it's missing some
-//! crucial parts like dmabufs.
+//! Virtual outputs with an optional surfaceless renderer. Tests can omit the renderer.
 
+use std::collections::HashMap;
 use std::mem;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use niri_config::OutputName;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::Fourcc;
 use smithay::backend::drm::DrmNode;
 use smithay::backend::egl::native::EGLSurfacelessDisplay;
 use smithay::backend::egl::{EGLContext, EGLDisplay};
+use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::RenderElementStates;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{GlesRenderer, GlesTexture};
+use smithay::backend::renderer::{Bind, ImportDma};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
-use smithay::utils::Size;
+use smithay::utils::{Physical, Size};
+use smithay::wayland::dmabuf::DmabufGlobal;
 use smithay::wayland::presentation::Refresh;
 
 use super::{IpcOutputMap, OutputId, RenderResult};
 use crate::niri::{Niri, RedrawState};
-use crate::render_helpers::{resources, shaders};
+use crate::render_helpers::{create_texture, resources, shaders, RenderCtx, RenderTarget};
 use crate::utils::{get_monotonic_time, logical_output};
 
 pub struct Headless {
     renderer: Option<GlesRenderer>,
     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+    frames: HashMap<Output, VirtualFrame>,
+    dmabuf_global: Option<DmabufGlobal>,
+}
+
+struct VirtualFrame {
+    size: Size<i32, Physical>,
+    texture: GlesTexture,
+    damage: OutputDamageTracker,
 }
 
 impl Headless {
@@ -34,10 +46,25 @@ impl Headless {
         Self {
             renderer: None,
             ipc_outputs: Default::default(),
+            frames: HashMap::new(),
+            dmabuf_global: None,
         }
     }
 
     pub fn init(&mut self, _niri: &mut Niri) {}
+
+    pub fn start(&mut self, niri: &mut Niri, size: (u16, u16)) -> anyhow::Result<()> {
+        self.add_renderer()?;
+        let formats = self.renderer.as_ref().unwrap().dmabuf_formats();
+        if formats.iter().next().is_some() {
+            let global = niri
+                .dmabuf_state
+                .create_global::<crate::niri::State>(&niri.display_handle, formats);
+            assert!(self.dmabuf_global.replace(global).is_none());
+        }
+        self.add_output(niri, 1, size);
+        Ok(())
+    }
 
     pub fn add_renderer(&mut self) -> anyhow::Result<()> {
         if self.renderer.is_some() {
@@ -133,7 +160,57 @@ impl Headless {
     }
 
     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
-        let states = RenderElementStates::default();
+        let states = if let Some(renderer) = &mut self.renderer {
+            let rendered = (|| -> anyhow::Result<_> {
+                let size = output
+                    .current_mode()
+                    .context("virtual output has no mode")?
+                    .size;
+                if !self
+                    .frames
+                    .get(output)
+                    .is_some_and(|frame| frame.size == size)
+                {
+                    self.frames.insert(
+                        output.clone(),
+                        VirtualFrame {
+                            size,
+                            texture: create_texture(renderer, size, Fourcc::Abgr8888)?,
+                            damage: OutputDamageTracker::from_output(output),
+                        },
+                    );
+                }
+                let elements = niri.render_to_vec(
+                    RenderCtx {
+                        renderer,
+                        target: RenderTarget::Output,
+                        xray: None,
+                    },
+                    output,
+                    true,
+                );
+                let frame = self.frames.get_mut(output).unwrap();
+                let mut target = renderer.bind(&mut frame.texture)?;
+                // The same offscreen buffer retains the previous frame's undamaged pixels.
+                let result =
+                    frame
+                        .damage
+                        .render_output(renderer, &mut target, 1, &elements, [0.; 4])?;
+                Ok(result.states)
+            })();
+            match rendered {
+                Ok(states) => {
+                    niri.update_primary_scanout_output(output, &states);
+                    states
+                }
+                Err(error) => {
+                    warn!("error rendering virtual output: {error:#}");
+                    return RenderResult::Skipped;
+                }
+            }
+        } else {
+            RenderElementStates::default()
+        };
         let mut presentation_feedbacks = niri.take_presentation_feedbacks(output, &states);
         presentation_feedbacks.presented::<_, smithay::utils::Monotonic>(
             get_monotonic_time(),
@@ -153,13 +230,36 @@ impl Headless {
 
         output_state.frame_callback_sequence = output_state.frame_callback_sequence.wrapping_add(1);
 
-        // FIXME: request redraw on unfinished animations remain
+        if self.renderer.is_some() {
+            let interval = Duration::from_nanos(1_000_000_000 / 60);
+            output_state.frame_clock.presented(get_monotonic_time());
+            output_state.redraw_state = RedrawState::WaitingForVBlank {
+                redraw_needed: false,
+            };
+            let output = output.clone();
+            niri.event_loop
+                .insert_source(Timer::from_duration(interval), move |_, _, state| {
+                    if let Some(output_state) = state.niri.output_state.get_mut(&output) {
+                        if let RedrawState::WaitingForVBlank { redraw_needed } =
+                            mem::replace(&mut output_state.redraw_state, RedrawState::Idle)
+                        {
+                            if redraw_needed || output_state.unfinished_animations_remain {
+                                output_state.redraw_state = RedrawState::Queued;
+                            }
+                        }
+                    }
+                    TimeoutAction::Drop
+                })
+                .unwrap();
+        }
 
         RenderResult::Submitted
     }
 
-    pub fn import_dmabuf(&mut self, _dmabuf: &Dmabuf) -> bool {
-        unimplemented!()
+    pub fn import_dmabuf(&mut self, dmabuf: &Dmabuf) -> bool {
+        self.renderer
+            .as_mut()
+            .is_some_and(|renderer| renderer.import_dmabuf(dmabuf, None).is_ok())
     }
 
     pub fn ipc_outputs(&self) -> Arc<Mutex<IpcOutputMap>> {
