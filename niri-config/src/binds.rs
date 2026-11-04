@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use bitflags::bitflags;
 use knuffel::errors::DecodeError;
+use knuffel::Decode as _;
 use miette::miette;
 use niri_ipc::{
     ColumnDisplay, LayoutSwitchTarget, PositionChange, SizeChange, WorkspaceReferenceArg,
@@ -14,7 +15,7 @@ use tracing::warn;
 
 use crate::input::ModKey;
 use crate::recent_windows::{MruDirection, MruFilter, MruScope};
-use crate::utils::{expect_only_children, MergeWith};
+use crate::utils::MergeWith;
 
 #[derive(Debug, Default, PartialEq)]
 pub struct Binds(pub Vec<Bind>);
@@ -911,13 +912,41 @@ where
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
     ) -> Result<Self, DecodeError<S>> {
-        expect_only_children(node, ctx);
+        if let Some(type_name) = &node.type_name {
+            ctx.emit_error(DecodeError::unexpected(
+                type_name,
+                "type name",
+                "no type name expected for this node",
+            ));
+        }
+
+        for val in &node.arguments {
+            ctx.emit_error(DecodeError::unexpected(
+                &val.literal,
+                "argument",
+                "no arguments expected for this node",
+            ));
+        }
+
+        let mut default_repeat = true;
+        for (name, val) in &node.properties {
+            match &***name {
+                "repeat" => default_repeat = knuffel::traits::DecodeScalar::decode(val, ctx)?,
+                name_str => {
+                    ctx.emit_error(DecodeError::unexpected(
+                        name,
+                        "property",
+                        format!("unexpected property `{}`", name_str.escape_default()),
+                    ));
+                }
+            }
+        }
 
         let mut nodes: Vec<&knuffel::ast::SpannedNode<S>> = Vec::new();
         let mut binds: Vec<Bind> = Vec::new();
 
         for child in node.children() {
-            match Bind::decode_node(child, ctx) {
+            match Bind::decode_with_default_repeat(child, ctx, default_repeat) {
                 Err(e) => {
                     ctx.emit_error(e);
                 }
@@ -962,6 +991,16 @@ where
     fn decode_node(
         node: &knuffel::ast::SpannedNode<S>,
         ctx: &mut knuffel::decode::Context<S>,
+    ) -> Result<Self, DecodeError<S>> {
+        Self::decode_with_default_repeat(node, ctx, true)
+    }
+}
+
+impl Bind {
+    fn decode_with_default_repeat<S: knuffel::traits::ErrorSpan>(
+        node: &knuffel::ast::SpannedNode<S>,
+        ctx: &mut knuffel::decode::Context<S>,
+        default_repeat: bool,
     ) -> Result<Self, DecodeError<S>> {
         if let Some(type_name) = &node.type_name {
             ctx.emit_error(DecodeError::unexpected(
@@ -1187,7 +1226,7 @@ where
 
         let repeat = match repeat {
             Some(value) => value,
-            None => release_action.is_none(),
+            None => default_repeat && release_action.is_none(),
         };
 
         let action = match (press_action, release_action) {
