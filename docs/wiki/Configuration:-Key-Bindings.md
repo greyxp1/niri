@@ -115,6 +115,16 @@ binds {
 }
 ```
 
+<sup>Since: next release</sup> Set `repeat=false` on the `binds` section to disable repetition by default for that section.
+Individual binds can override this with `repeat=true`:
+
+```kdl
+binds repeat=false {
+    Mod+T { spawn "alacritty"; }
+    Mod+Left repeat=true { focus-column-left; }
+}
+```
+
 Binds can also have a cooldown, which will rate-limit the bind and prevent it from repeatedly triggering too quickly.
 
 ```kdl
