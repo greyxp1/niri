@@ -897,6 +897,7 @@ impl XdgShellHandler for State {
             .is_some()
         {
             // An unmapped toplevel got destroyed.
+            self.retire_empty_agent_handoffs();
             return;
         }
 
@@ -933,6 +934,7 @@ impl XdgShellHandler for State {
 
         self.niri.window_mru_ui.remove_window(id);
         self.niri.layout.remove_window(&window, transaction.clone());
+        self.retire_empty_agent_handoffs();
 
         let surface = surface.wl_surface();
         // This check is necessary because implicit resource destruction is done with
