@@ -133,6 +133,23 @@ pub enum Request {
         /// Workspace name.
         workspace: String,
     },
+    /// Check whether a workspace needs explicit cleanup before an agent stops.
+    AgentCleanupCheck {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Finish computer use and close its unclaimed windows without terminating shared apps.
+    AgentFinish {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Preserve a window after computer use finishes.
+    AgentKeepWindow {
+        /// Workspace name.
+        workspace: String,
+        /// Window ID.
+        window_id: u64,
+    },
     /// Pause workspace automation for human assistance.
     AgentHandoff {
         /// Workspace name.
@@ -317,6 +334,8 @@ pub enum Response {
     AgentScreenshot(AgentScreenshotInfo),
     /// Workspace reservation or control state.
     AgentWorkspace(AgentWorkspace),
+    /// Whether explicit workspace cleanup is needed.
+    AgentCleanupNeeded(bool),
     /// The version string for the running niri instance.
     Version(String),
     /// Information about connected outputs.

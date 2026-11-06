@@ -1408,6 +1408,23 @@ impl<W: LayoutElement> Layout<W> {
             ws.is_agent = false;
         }
         for monitor in self.monitors_mut().filter(|monitor| monitor.has_ws(id)) {
+            if monitor
+                .workspaces
+                .iter()
+                .take_while(|ws| ws.id() != id)
+                .any(|ws| ws.is_agent)
+            {
+                let active = monitor.active_workspace_ref().id();
+                let terminal = monitor.workspaces.pop().unwrap();
+                monitor.workspaces.sort_by_key(|ws| ws.is_agent);
+                monitor.workspaces.push(terminal);
+                monitor.active_workspace_idx = monitor
+                    .workspaces
+                    .iter()
+                    .position(|ws| ws.id() == active)
+                    .unwrap();
+                monitor.workspace_switch = None;
+            }
             if monitor.workspace_switch.is_none() {
                 monitor.clean_up_workspaces();
             }
