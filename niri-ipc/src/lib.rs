@@ -336,6 +336,8 @@ pub enum Response {
     AgentWorkspace(AgentWorkspace),
     /// Whether explicit workspace cleanup is needed.
     AgentCleanupNeeded(bool),
+    /// Whether an agent workspace finished rather than preserving a handoff.
+    AgentFinished(bool),
     /// The version string for the running niri instance.
     Version(String),
     /// Information about connected outputs.

@@ -165,11 +165,24 @@ fn agent_window_ancestors(surface: &WlSurface) -> Vec<WlSurface> {
 }
 
 impl Niri {
+    fn agent_handoff_pending(&self, entry: &AgentWorkspaceState) -> bool {
+        let id = WorkspaceId::specific(entry.info.id);
+        entry.info.paused
+            && (self
+                .layout
+                .find_workspace_by_id(id)
+                .is_some_and(|(_, workspace)| workspace.windows().next().is_some())
+                || self.unmapped_windows.keys().any(|surface| {
+                    self.agent_launch_for_surface(surface)
+                        .is_some_and(|launch| launch.workspace_id == id)
+                }))
+    }
+
     pub fn agent_cleanup_needed(&self, name: &str) -> bool {
         self.agent_input
             .workspaces
             .get(&name.to_ascii_lowercase())
-            .is_some_and(|entry| !entry.info.paused)
+            .is_some_and(|entry| !self.agent_handoff_pending(entry))
     }
 
     pub fn keep_agent_window(&mut self, window_id: u64, scope: Option<&str>) -> Result<(), String> {
@@ -209,7 +222,7 @@ impl Niri {
         let Some(entry) = self.agent_input.workspaces.get(&name) else {
             return Ok(());
         };
-        if entry.info.paused {
+        if self.agent_handoff_pending(entry) {
             return Ok(());
         }
         let id = WorkspaceId::specific(entry.info.id);
@@ -792,23 +805,41 @@ fn same_client(surface: &WlSurface, client: &Client) -> bool {
 }
 
 impl State {
-    pub fn finish_agent_workspace(&mut self, name: &str) -> Result<(), String> {
+    pub fn retire_empty_agent_handoffs(&mut self) {
+        let names: Vec<_> = self
+            .niri
+            .agent_input
+            .workspaces
+            .iter()
+            .filter(|(_, entry)| {
+                entry.info.paused
+                    && entry.connections.is_empty()
+                    && !self.niri.agent_handoff_pending(entry)
+            })
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in names {
+            let _ = self.finish_agent_workspace(&name);
+        }
+    }
+
+    pub fn finish_agent_workspace(&mut self, name: &str) -> Result<bool, String> {
         let Some(entry) = self
             .niri
             .agent_input
             .workspaces
             .get(&name.to_ascii_lowercase())
         else {
-            return Ok(());
+            return Ok(true);
         };
-        if entry.info.paused {
-            return Ok(());
+        if self.niri.agent_handoff_pending(entry) {
+            return Ok(false);
         }
         let owners: Vec<_> = entry.connections.iter().copied().collect();
         for owner in owners {
             self.agent_disconnect(owner);
         }
-        self.niri.finish_agent_workspace(name)
+        self.niri.finish_agent_workspace(name).map(|()| true)
     }
 
     pub fn set_agent_workspace_control(

@@ -74,6 +74,7 @@ impl Drop for ClientCtx {
         if let Some(name) = self.agent_workspace.take() {
             self.event_loop.insert_idle(move |state| {
                 let _ = state.niri.agent_workspace_changed(name, false, owner);
+                state.retire_empty_agent_handoffs();
                 state.niri.queue_redraw_all();
             });
         }
@@ -575,10 +576,11 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                 }
                 let _ = tx.send_blocking(state.finish_agent_workspace(&workspace));
             });
-            rx.recv()
-                .await
-                .map_err(|_| "error finishing agent workspace".to_owned())??;
-            Response::Handled
+            Response::AgentFinished(
+                rx.recv()
+                    .await
+                    .map_err(|_| "error finishing agent workspace".to_owned())??,
+            )
         }
         Request::AgentKeepWindow {
             workspace,
