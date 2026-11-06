@@ -41,6 +41,7 @@
         rustPlatform.buildRustPackage {
           pname = "niri";
           version = revision;
+          passthru.mcpCompletionCleanup = true;
 
           src = lib.fileset.toSource {
             root = ./.;

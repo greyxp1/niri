@@ -41,6 +41,9 @@ pub struct Cli {
 pub enum Sub {
     /// Expose background computer-use tools over MCP stdio.
     Mcp {
+        /// Check agent cleanup from a Stop hook on stdin.
+        #[arg(long, conflicts_with_all = ["isolated", "workspace", "desktop", "headless"])]
+        check_cleanup: bool,
         /// Isolate applications in a private Wayland session with a temporary home and writable
         /// cwd.
         #[arg(long, conflicts_with = "desktop")]

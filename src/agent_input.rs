@@ -146,7 +146,111 @@ impl AgentSurface {
     }
 }
 
+fn agent_window_ancestors(surface: &WlSurface) -> Vec<WlSurface> {
+    let mut ancestors = Vec::new();
+    let mut current = Some(surface.clone());
+    while let Some(surface) = current {
+        if ancestors.contains(&surface) {
+            break;
+        }
+        current = smithay::wayland::compositor::with_states(&surface, |states| {
+            states
+                .data_map
+                .get::<smithay::wayland::shell::xdg::XdgToplevelSurfaceData>()
+                .and_then(|role| role.lock().unwrap().parent.clone())
+        });
+        ancestors.push(surface);
+    }
+    ancestors
+}
+
 impl Niri {
+    pub fn agent_cleanup_needed(&self, name: &str) -> bool {
+        self.agent_input
+            .workspaces
+            .get(&name.to_ascii_lowercase())
+            .is_some_and(|entry| !entry.info.paused)
+    }
+
+    pub fn keep_agent_window(&mut self, window_id: u64, scope: Option<&str>) -> Result<(), String> {
+        self.check_agent_workspace_access(window_id, scope)?;
+        let surface = self
+            .layout
+            .windows()
+            .find(|(_, w)| w.id().get() == window_id)
+            .map(|(_, w)| w.toplevel().wl_surface().clone())
+            .ok_or("window no longer exists")?;
+        self.set_agent_window_retained(&surface);
+        Ok(())
+    }
+
+    pub fn keep_agent_surface(&mut self, surface: &WlSurface) {
+        let root = self.find_root_shell_surface(surface);
+        if self.agent_launch_for_surface(&root).is_some_and(|launch| {
+            self.agent_input
+                .workspaces
+                .get(&launch.name)
+                .is_some_and(|entry| !entry.info.paused)
+        }) {
+            self.set_agent_window_retained(&root);
+        }
+    }
+
+    fn set_agent_window_retained(&mut self, surface: &WlSurface) {
+        for surface in agent_window_ancestors(surface) {
+            if let Some((window, _)) = self.layout.find_window_and_output_mut(&surface) {
+                window.is_agent_retained = true;
+            }
+        }
+    }
+
+    pub fn finish_agent_workspace(&mut self, name: &str) -> Result<(), String> {
+        let name = name.to_ascii_lowercase();
+        let Some(entry) = self.agent_input.workspaces.get(&name) else {
+            return Ok(());
+        };
+        if entry.info.paused {
+            return Ok(());
+        }
+        let id = WorkspaceId::specific(entry.info.id);
+        if let Some((_, workspace)) = self.layout.find_workspace_by_id(id) {
+            for window in workspace.windows() {
+                let surface = window.toplevel().wl_surface();
+                if !agent_window_ancestors(surface).iter().any(|surface| {
+                    self.layout
+                        .find_window_and_output(surface)
+                        .is_some_and(|(w, _)| w.is_agent_retained)
+                }) && self
+                    .agent_launch_for_surface(surface)
+                    .is_some_and(|launch| {
+                        launch.workspace_id == id && !launch.existing.contains(&window.id().get())
+                    })
+                {
+                    window.toplevel().send_close();
+                }
+            }
+        }
+        self.agent_input.workspaces.remove(&name);
+        self.layout.release_agent_workspace(id);
+        let configured = self
+            .layout
+            .find_workspace_by_id(id)
+            .is_some_and(|(_, workspace)| {
+                workspace.name().is_some_and(|name| {
+                    self.config
+                        .borrow()
+                        .workspaces
+                        .iter()
+                        .any(|w| w.name.0.eq_ignore_ascii_case(name))
+                })
+            });
+        if !configured {
+            self.layout.unname_workspace_by_id(id);
+        }
+        self.queue_redraw_all();
+        Ok(())
+    }
+
     pub fn agent_workspace_changed(
         &mut self,
         name: String,
@@ -266,6 +370,12 @@ impl Niri {
     pub fn agent_workspace_for_client(&self, surface: &WlSurface) -> Option<WorkspaceId> {
         self.agent_launch_for_surface(surface)
             .map(|launch| launch.workspace_id)
+            .filter(|id| {
+                self.agent_input
+                    .workspaces
+                    .values()
+                    .any(|entry| entry.info.id == id.get())
+            })
     }
 
     pub fn agent_launch_display(
@@ -682,6 +792,25 @@ fn same_client(surface: &WlSurface, client: &Client) -> bool {
 }
 
 impl State {
+    pub fn finish_agent_workspace(&mut self, name: &str) -> Result<(), String> {
+        let Some(entry) = self
+            .niri
+            .agent_input
+            .workspaces
+            .get(&name.to_ascii_lowercase())
+        else {
+            return Ok(());
+        };
+        if entry.info.paused {
+            return Ok(());
+        }
+        let owners: Vec<_> = entry.connections.iter().copied().collect();
+        for owner in owners {
+            self.agent_disconnect(owner);
+        }
+        self.niri.finish_agent_workspace(name)
+    }
+
     pub fn set_agent_workspace_control(
         &mut self,
         name: &str,

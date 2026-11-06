@@ -110,6 +110,35 @@ const MAX_IMAGE: usize = 2 * 1024 * 1024;
 const MAX_SIDE: u32 = 1920;
 const MAX_CONTEXTS: usize = 32;
 
+pub fn check_cleanup() -> Result<()> {
+    let mut input = Vec::new();
+    io::stdin().take(MAX_REQUEST + 1).read_to_end(&mut input)?;
+    ensure!(
+        input.len() as u64 <= MAX_REQUEST,
+        "hook input exceeds 1 MiB"
+    );
+    let hook: Value = serde_json::from_slice(&input)?;
+    ensure!(hook["hook_event_name"] == "Stop", "expected a Stop hook");
+    let params = json!({"_meta":{"threadId":hook["session_id"]}});
+    let workspace = thread_workspace(&params)?;
+    session::desktop_environment()?;
+    let mut socket = Socket::connect()?;
+    socket.set_timeout(Some(Duration::from_secs(2)))?;
+    let response = socket
+        .send(Request::AgentCleanupCheck { workspace })?
+        .map_err(anyhow::Error::msg)?;
+    let Response::AgentCleanupNeeded(needed) = response else {
+        bail!("unexpected cleanup check response")
+    };
+    let output = if needed {
+        json!({"decision":"block","reason":"Computer use is still open. Continue unfinished work, or use keep_window for results the user wants to retain and call finish_session before replying. Pending human handoffs are preserved."})
+    } else {
+        json!({})
+    };
+    println!("{output}");
+    Ok(())
+}
+
 #[derive(Default)]
 struct Control {
     active: Option<String>,
@@ -347,6 +376,8 @@ fn tools() -> Vec<Value> {
         tool("get_session_state", "Read the host, workspace and pause state.", json!({}), &[], true),
         tool("request_handoff", "Pause automation for human help. Tell the user what to do in the agent workspace, then wait for their confirmation.", json!({"reason":text}), &["reason"], false),
         tool("resume_session", "Resume workspace automation only after the user explicitly returns control, for example by saying done in chat. Inspect the app again before continuing.", json!({}), &[], false),
+        tool("keep_window", "Keep an agent window after the task finishes, when the user asks to keep it or needs its result.", json!({"window_id":id}), &["window_id"], false),
+        tool("finish_session", "Close unclaimed agent windows and release the workspace when computer use is finished. Pending human handoffs are preserved.", json!({}), &[], false),
         tool("list_layers", "List mapped layer-shell surfaces with stable IDs, namespaces, process IDs and output-local geometry. Use layer_id to target one explicitly.", json!({}), &[], true),
         tool("list_windows", "List Niri windows, stable IDs, process IDs, layout and real focus state.", json!({}), &[], true),
         tool("get_app_state", "Inspect one exact window, its accessibility tree and optionally its screenshot. Screenshot and input preserve real focus. Accessibility actions require the returned snapshot_id and element_index.", json!({"window_id":id,"include_screenshot":{"type":"boolean"},"max_nodes":{"type":"integer","minimum":1,"maximum":2000},"max_depth":{"type":"integer","minimum":1,"maximum":64}}), &["window_id"], true),
@@ -370,6 +401,9 @@ fn tools() -> Vec<Value> {
     tools
         .into_iter()
         .map(|mut tool| {
+            if tool["name"] == "keep_window" {
+                return tool;
+            }
             let schema = &mut tool["inputSchema"];
             if schema["properties"].get("window_id").is_some() {
                 schema["properties"]["layer_id"] = id.clone();
@@ -588,7 +622,11 @@ impl Server {
             .is_some_and(|w| w.paused && w.reason.is_some() && !w.handoff_for_other_session);
         if !matches!(
             name,
-            "get_session_state" | "request_handoff" | "resume_session"
+            "get_session_state"
+                | "request_handoff"
+                | "resume_session"
+                | "finish_session"
+                | "keep_window"
         ) && status.as_ref().is_some_and(|w| w.paused)
         {
             self.invalidate();
@@ -629,6 +667,27 @@ impl Server {
                     }
                     _ => bail!("unexpected workspace control response"),
                 }
+            }
+            "keep_window" => {
+                let workspace = std::env::var("NIRI_MCP_WORKSPACE")
+                    .context("keeping a window requires workspace mode")?;
+                request(Request::AgentKeepWindow {
+                    workspace,
+                    window_id: integer(args, "window_id")?,
+                })?;
+                self.invalidate();
+                json!({"kept":true})
+            }
+            "finish_session" => {
+                let workspace = std::env::var("NIRI_MCP_WORKSPACE")
+                    .context("finishing a session requires workspace mode")?;
+                let paused = status.as_ref().is_some_and(|s| s.paused);
+                request(Request::AgentFinish { workspace })?;
+                self.invalidate();
+                if !paused {
+                    CONNECTION.with_borrow_mut(|c| *c = None);
+                }
+                json!({"finished":!paused,"handoff_preserved":paused})
             }
             "list_windows" => json!({"windows":windows()?}),
             "list_layers" => json!({"layers":layers()?}),
@@ -833,8 +892,10 @@ impl Server {
         if let Some((id, geometry)) = pending_capture {
             self.captures.insert(id, geometry);
         }
-        if !matches!(name, "get_session_state" | "request_handoff")
-            && workspace_status()?.is_some_and(|w| w.paused)
+        if !matches!(
+            name,
+            "get_session_state" | "request_handoff" | "finish_session"
+        ) && workspace_status()?.is_some_and(|w| w.paused)
         {
             self.invalidate();
             bail!(
@@ -1035,7 +1096,7 @@ fn serve(mut input: impl BufRead + Send + 'static, automatic_workspace: bool) ->
                                     "2025-11-25"
                                 };
                             Ok(
-                                json!({"protocolVersion":protocol,"capabilities":{"tools":{}},"serverInfo":{"name":"niri","version":env!("CARGO_PKG_VERSION")},"instructions":"Start with list_windows or list_layers, then get_app_state for an explicit window_id or layer_id. Use exactly one target selector. Layer accessibility matches PID and namespace against an accessible window name, when available. Pointer coordinates use its latest returned screenshot. Input and captures preserve real focus and never fall back to global input. Workspace mode exposes only its own windows. Open browser windows with --new-window to reuse existing sign-ins. Use request_handoff when human help is needed and tell the user what to do on the host and workspace returned by get_session_state. Stay paused until the user explicitly returns control in chat, then call resume_session. If handoff_for_other_session is true, wait for that thread instead of asking the user to resume this thread. Inspect the app again before continuing. Launch apps through launch_app. Accessibility actions require snapshot_id and element_index from get_app_state. Every mutating tool invalidates the accessibility snapshot. Browser accessibility may require --force-renderer-accessibility."}),
+                                json!({"protocolVersion":protocol,"capabilities":{"tools":{}},"serverInfo":{"name":"niri","version":env!("CARGO_PKG_VERSION")},"instructions":"Start with list_windows or list_layers, then get_app_state for an explicit window_id or layer_id. Use exactly one target selector. Layer accessibility matches PID and namespace against an accessible window name, when available. Pointer coordinates use its latest returned screenshot. Input and captures preserve real focus and never fall back to global input. Workspace mode exposes only its own windows. Open browser windows with --new-window to reuse existing sign-ins. Use request_handoff when human help is needed and tell the user what to do on the host and workspace returned by get_session_state. Stay paused until the user explicitly returns control in chat, then call resume_session. If handoff_for_other_session is true, wait for that thread instead of asking the user to resume this thread. Inspect the app again before continuing. Launch apps through launch_app. When computer use is done, retain requested result windows with keep_window and call finish_session before replying. Accessibility actions require snapshot_id and element_index from get_app_state. Every mutating tool invalidates the accessibility snapshot. Browser accessibility may require --force-renderer-accessibility."}),
                             )
                         }
                         "ping" => Ok(json!({})),
