@@ -104,6 +104,9 @@ pub struct Mapped {
     /// Whether this window recently received computer-use agent input or screenshots.
     is_agent_driven: bool,
 
+    /// The human retained this mapped window after computer use.
+    pub(crate) is_agent_retained: bool,
+
     /// The agent's pointer indicator.
     agent_cursor: Option<AgentCursor>,
 
@@ -298,6 +301,7 @@ impl Mapped {
             is_floating: false,
             is_window_cast_target: false,
             is_agent_driven: false,
+            is_agent_retained: false,
             agent_cursor: None,
             ignore_opacity_window_rule: false,
             block_out_buffer: RefCell::new(SolidColorBuffer::new((0., 0.), [0., 0., 0., 1.])),

@@ -100,11 +100,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(subcommand) = cli.subcommand {
         match subcommand {
             Sub::Mcp {
+                check_cleanup,
                 isolated,
                 desktop,
                 headless,
                 workspace,
             } => {
+                if check_cleanup {
+                    niri::mcp::check_cleanup()?;
+                    return Ok(());
+                }
                 niri::mcp::run(isolated, desktop, headless, workspace)?;
                 return Ok(());
             }

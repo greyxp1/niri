@@ -555,6 +555,44 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             let casts = state.casts.casts.values().cloned().collect();
             Response::Casts(casts)
         }
+        Request::AgentCleanupCheck { workspace } => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(state.niri.agent_cleanup_needed(&workspace));
+            });
+            Response::AgentCleanupNeeded(
+                rx.recv()
+                    .await
+                    .map_err(|_| "error checking agent cleanup".to_owned())?,
+            )
+        }
+        Request::AgentFinish { workspace } => {
+            let (tx, rx) = async_channel::bounded(1);
+            let alive = ctx.alive.clone();
+            ctx.event_loop.insert_idle(move |state| {
+                if !alive.get() {
+                    return;
+                }
+                let _ = tx.send_blocking(state.finish_agent_workspace(&workspace));
+            });
+            rx.recv()
+                .await
+                .map_err(|_| "error finishing agent workspace".to_owned())??;
+            Response::Handled
+        }
+        Request::AgentKeepWindow {
+            workspace,
+            window_id,
+        } => {
+            let (tx, rx) = async_channel::bounded(1);
+            ctx.event_loop.insert_idle(move |state| {
+                let _ = tx.send_blocking(state.niri.keep_agent_window(window_id, Some(&workspace)));
+            });
+            rx.recv()
+                .await
+                .map_err(|_| "error keeping agent window".to_owned())??;
+            Response::Handled
+        }
         Request::AgentWorkspace { ref workspace }
         | Request::AgentWorkspaceStatus { ref workspace } => {
             let workspace = workspace.clone();
