@@ -681,13 +681,16 @@ impl Server {
             "finish_session" => {
                 let workspace = std::env::var("NIRI_MCP_WORKSPACE")
                     .context("finishing a session requires workspace mode")?;
-                let paused = status.as_ref().is_some_and(|s| s.paused);
-                request(Request::AgentFinish { workspace })?;
+                let finished = match request(Request::AgentFinish { workspace })? {
+                    Response::AgentFinished(finished) => finished,
+                    _ => bail!("unexpected finish response"),
+                };
+                self.handoff = !finished;
                 self.invalidate();
-                if !paused {
+                if finished {
                     CONNECTION.with_borrow_mut(|c| *c = None);
                 }
-                json!({"finished":!paused,"handoff_preserved":paused})
+                json!({"finished":finished,"handoff_preserved":!finished})
             }
             "list_windows" => json!({"windows":windows()?}),
             "list_layers" => json!({"layers":layers()?}),
