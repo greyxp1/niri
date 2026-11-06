@@ -51,8 +51,13 @@ jobs:
           nix build --impure --print-build-logs --cores 2 --max-jobs 1 --expr '
             let
               workspace = builtins.getEnv "GITHUB_WORKSPACE";
-              niri = builtins.getFlake ("git+file://" + workspace + "/niri");
+              source = builtins.getFlake ("git+file://" + workspace + "/niri");
               nixconf = builtins.getFlake ("git+file://" + workspace + "/nixconf");
+              inputs = (import (nixconf.outPath + "/.tack")) {};
+              niri = (import (source.outPath + "/flake.nix")).outputs {
+                self = source;
+                nixpkgs = inputs.nixpkgs;
+              };
               outputs = (import (nixconf.outPath + "/flake.nix")).outputs {
                 self = nixconf;
                 tackOverrides = { inherit niri; };
