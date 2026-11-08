@@ -123,6 +123,13 @@ pub enum Request {
     Casts,
     /// Show the agent indicator while this dedicated IPC connection remains open.
     AgentSession,
+    /// Control a desktop test across temporary IPC connections.
+    AgentDesktopSession {
+        /// Stable thread identity.
+        session: String,
+        /// Session lifecycle operation.
+        action: AgentDesktopAction,
+    },
     /// Reserve an agent workspace while this dedicated connection remains open.
     AgentWorkspace {
         /// Workspace name.
@@ -202,6 +209,37 @@ pub enum Request {
         /// Whether to include the pointer if it is over the window.
         show_pointer: bool,
     },
+}
+
+/// Desktop test lifecycle operations.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentDesktopAction {
+    /// Begin or inspect a desktop test.
+    Status,
+    /// Return desktop control to the user.
+    Handoff {
+        /// What the user needs to do.
+        reason: String,
+    },
+    /// Continue after the user returns control.
+    Resume,
+    /// Finish without closing personal windows.
+    Finish,
+}
+
+/// A desktop test that remains open between tool connections.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentDesktopSession {
+    /// Stable thread identity.
+    pub name: String,
+    /// Automation is paused for human control.
+    pub paused: bool,
+    /// Requested human intervention.
+    pub reason: Option<String>,
+    /// Another connected session requested the pending human handoff.
+    pub handoff_for_other_session: bool,
 }
 
 /// A workspace reserved by an agent connection.
@@ -328,6 +366,8 @@ pub type Reply = Result<Response, String>;
 pub enum Response {
     /// A request that does not need a response was handled successfully.
     Handled,
+    /// Desktop test state, or None after completion.
+    AgentDesktopSession(Option<AgentDesktopSession>),
     /// New window IDs from a workspace application launch.
     AgentSpawn(Vec<u64>),
     /// Result of [`Request::AgentScreenshot`].
