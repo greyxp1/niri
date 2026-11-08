@@ -116,6 +116,8 @@ pub struct AgentWorkspaceLaunch {
     pub(crate) created: Instant,
 }
 
+struct AgentWindowRetained;
+
 enum AgentSurface {
     Window(Window, WlSurface),
     Layer(LayerSurface),
@@ -273,10 +275,22 @@ impl Niri {
         }
     }
 
-    fn set_agent_window_retained(&mut self, surface: &WlSurface) {
+    fn agent_window_for_surface(&self, surface: &WlSurface) -> Option<&Window> {
+        self.layout
+            .find_window_and_output(surface)
+            .map(|(mapped, _)| &mapped.window)
+            .or_else(|| {
+                self.unmapped_windows
+                    .get(surface)
+                    .map(|window| &window.window)
+            })
+    }
+
+    fn set_agent_window_retained(&self, surface: &WlSurface) {
         for surface in agent_window_ancestors(surface) {
-            if let Some((window, _)) = self.layout.find_window_and_output_mut(&surface) {
-                window.is_agent_retained = true;
+            if let Some(window) = self.agent_window_for_surface(&surface) {
+                // Window userdata survives unmapping but ends with this toplevel.
+                window.user_data().insert_if_missing(|| AgentWindowRetained);
             }
         }
     }
@@ -294,9 +308,10 @@ impl Niri {
             for window in workspace.windows() {
                 let surface = window.toplevel().wl_surface();
                 if !agent_window_ancestors(surface).iter().any(|surface| {
-                    self.layout
-                        .find_window_and_output(surface)
-                        .is_some_and(|(w, _)| w.is_agent_retained)
+                    self.agent_window_for_surface(surface)
+                        .is_some_and(|window| {
+                            window.user_data().get::<AgentWindowRetained>().is_some()
+                        })
                 }) && self
                     .agent_launch_for_surface(surface)
                     .is_some_and(|launch| {
