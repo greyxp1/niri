@@ -293,5 +293,5 @@ xwayland-satellite { off; }
         .await?;
         super::accessibility::enable().await
     })?;
-    super::serve(input, false)
+    super::serve(input, false, false)
 }

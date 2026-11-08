@@ -48,7 +48,7 @@ pub fn run(
             if let Err(error) = accessibility::bounded(accessibility::enable()) {
                 tracing::warn!(?error, "could not enable desktop accessibility");
             }
-            serve(input, automatic_workspace)
+            serve(input, automatic_workspace, true)
         }
     }
 }
@@ -196,6 +196,11 @@ fn request(request: Request) -> Result<Response> {
             socket
                 .send(if let Ok(workspace) = std::env::var("NIRI_MCP_WORKSPACE") {
                     Request::AgentWorkspace { workspace }
+                } else if let Ok(session) = std::env::var("NIRI_MCP_DESKTOP_SESSION") {
+                    Request::AgentDesktopSession {
+                        session,
+                        action: niri_ipc::AgentDesktopAction::Status,
+                    }
                 } else {
                     Request::AgentSession
                 })?
@@ -230,14 +235,23 @@ fn workspace_status() -> Result<Option<niri_ipc::AgentWorkspace>> {
     }
 }
 
+fn desktop_control(
+    action: niri_ipc::AgentDesktopAction,
+) -> Result<Option<niri_ipc::AgentDesktopSession>> {
+    let session = std::env::var("NIRI_MCP_DESKTOP_SESSION")
+        .context("desktop control requires a thread identity")?;
+    match request(Request::AgentDesktopSession { session, action })? {
+        Response::AgentDesktopSession(info) => Ok(info),
+        _ => bail!("unexpected desktop session response"),
+    }
+}
+
 fn thread_workspace(params: &Value) -> Result<String> {
     let thread = std::env::var("T3CODE_THREAD_ID")
         .ok()
         .or_else(|| params["_meta"]["threadId"].as_str().map(str::to_owned))
         .or_else(|| std::env::var("CODEX_THREAD_ID").ok())
-        .context(
-            "Thread identity is missing. Use --workspace NAME to choose an explicit workspace.",
-        )?;
+        .context("Thread identity is missing. Supply _meta.threadId or use --workspace NAME.")?;
     ensure!(
         !thread.is_empty() && thread.len() <= 4096,
         "invalid thread identity"
@@ -419,10 +433,10 @@ fn tools() -> Vec<Value> {
     let modifiers = json!({"type":"array","items":{"enum":["Ctrl","Shift","Alt","Super"]},"maxItems":4,"uniqueItems":true});
     let tools = vec![
         tool("get_session_state", "Read the host, workspace and pause state.", json!({}), &[], true),
-        tool("request_handoff", "Pause automation for human help. Tell the user what to do in the agent workspace, then wait for their confirmation.", json!({"reason":{"type":"string","minLength":1,"maxLength":240}}), &["reason"], false),
-        tool("resume_session", "Resume workspace automation only after the user explicitly returns control, for example by saying done in chat. Inspect the app again before continuing.", json!({}), &[], false),
+        tool("request_handoff", "Pause automation for human help, then wait for the user to return control.", json!({"reason":{"type":"string","minLength":1,"maxLength":240}}), &["reason"], false),
+        tool("resume_session", "Resume automation only after the user explicitly returns control. Inspect the app again before continuing.", json!({}), &[], false),
         tool("keep_window", "Keep an agent window after the task finishes, when the user asks to keep it or needs its result.", json!({"window_id":id}), &["window_id"], false),
-        tool("finish_session", "Close unclaimed agent windows and release the workspace when computer use is finished. Pending human handoffs are preserved.", json!({}), &[], false),
+        tool("finish_session", "Finish computer use and clear its indicator. Workspace mode closes unclaimed agent windows. Desktop mode preserves personal windows. Pending human handoffs are preserved.", json!({}), &[], false),
         tool("list_layers", "List mapped layer-shell surfaces with stable IDs, namespaces, process IDs and output-local geometry. Use layer_id to target one explicitly.", json!({}), &[], true),
         tool("list_windows", "List Niri windows, stable IDs, process IDs, layout and real focus state.", json!({}), &[], true),
         tool("get_app_state", "Inspect one exact window, its accessibility tree and optionally its screenshot. Screenshot and input preserve real focus. Accessibility actions require the returned snapshot_id and element_index.", json!({"window_id":id,"include_screenshot":{"type":"boolean"},"max_nodes":{"type":"integer","minimum":1,"maximum":2000},"max_depth":{"type":"integer","minimum":1,"maximum":64}}), &["window_id"], true),
@@ -662,9 +676,17 @@ impl Server {
 
     fn call(&mut self, name: &str, args: &Value) -> Result<Value> {
         let status = workspace_status()?;
+        let desktop = if std::env::var_os("NIRI_MCP_DESKTOP_SESSION").is_some() {
+            desktop_control(niri_ipc::AgentDesktopAction::Status)?
+        } else {
+            None
+        };
         self.handoff = status
             .as_ref()
-            .is_some_and(|w| w.paused && w.reason.is_some() && !w.handoff_for_other_session);
+            .is_some_and(|w| w.paused && w.reason.is_some() && !w.handoff_for_other_session)
+            || desktop
+                .as_ref()
+                .is_some_and(|s| s.paused && !s.handoff_for_other_session);
         if !matches!(
             name,
             "get_session_state"
@@ -672,45 +694,73 @@ impl Server {
                 | "resume_session"
                 | "finish_session"
                 | "keep_window"
-        ) && status.as_ref().is_some_and(|w| w.paused)
+        ) && (status.as_ref().is_some_and(|w| w.paused)
+            || desktop.as_ref().is_some_and(|s| s.paused))
         {
             self.invalidate();
-            let status = status.as_ref().unwrap();
-            if status.handoff_for_other_session {
-                bail!("Another agent session is waiting for human help: {}. Wait for that handoff to finish in its thread without asking the user to resume this thread.", status.reason.as_deref().unwrap_or("human assistance"));
+            if status.as_ref().is_some_and(|s| s.handoff_for_other_session)
+                || desktop
+                    .as_ref()
+                    .is_some_and(|s| s.handoff_for_other_session)
+            {
+                let reason = status
+                    .as_ref()
+                    .and_then(|s| s.reason.as_deref())
+                    .or_else(|| desktop.as_ref().and_then(|s| s.reason.as_deref()));
+                bail!("Another agent session is waiting for human help: {}. Wait for that handoff to finish in its thread without asking the user to resume this thread.", reason.unwrap_or("human assistance"));
             }
-            bail!("Workspace automation is paused. Check get_session_state and wait for the user to return control before calling resume_session.");
+            bail!("Automation is paused. Check get_session_state and wait for the user to return control before calling resume_session.");
         }
         let mut content = Vec::new();
         let mut pending_capture = None;
         let data = match name {
             "get_session_state" => {
-                let mut state =
-                    status.map_or_else(|| Ok(json!({"workspace":null})), serde_json::to_value)?;
+                let mut state = if let Some(desktop) = desktop {
+                    let mut state = serde_json::to_value(desktop)?;
+                    state["mode"] = json!("desktop");
+                    state["workspace"] = Value::Null;
+                    state
+                } else {
+                    status.map_or_else(|| Ok(json!({"workspace":null})), serde_json::to_value)?
+                };
                 state["host"] = std::fs::read_to_string("/proc/sys/kernel/hostname")
                     .map(|name| json!(name.trim()))
                     .unwrap_or(Value::Null);
                 state
             }
             "request_handoff" | "resume_session" => {
-                status.context("human handoff requires workspace mode")?;
-                let workspace = std::env::var("NIRI_MCP_WORKSPACE")?;
                 self.invalidate();
-                let control = if name == "request_handoff" {
-                    Request::AgentHandoff {
-                        workspace,
-                        reason: string(args, "reason")?.to_owned(),
-                    }
+                if desktop.is_some() {
+                    let action = if name == "request_handoff" {
+                        niri_ipc::AgentDesktopAction::Handoff {
+                            reason: string(args, "reason")?.to_owned(),
+                        }
+                    } else {
+                        niri_ipc::AgentDesktopAction::Resume
+                    };
+                    let info = desktop_control(action)?.context("desktop session is not open")?;
+                    self.handoff = info.paused;
+                    serde_json::to_value(info)?
                 } else {
-                    Request::AgentResume { workspace }
-                };
-                match request(control)? {
-                    Response::AgentWorkspace(info) => {
-                        self.handoff =
-                            info.paused && info.reason.is_some() && !info.handoff_for_other_session;
-                        serde_json::to_value(info)?
+                    status.context("human handoff requires workspace or desktop mode")?;
+                    let workspace = std::env::var("NIRI_MCP_WORKSPACE")?;
+                    let control = if name == "request_handoff" {
+                        Request::AgentHandoff {
+                            workspace,
+                            reason: string(args, "reason")?.to_owned(),
+                        }
+                    } else {
+                        Request::AgentResume { workspace }
+                    };
+                    match request(control)? {
+                        Response::AgentWorkspace(info) => {
+                            self.handoff = info.paused
+                                && info.reason.is_some()
+                                && !info.handoff_for_other_session;
+                            serde_json::to_value(info)?
+                        }
+                        _ => bail!("unexpected workspace control response"),
                     }
-                    _ => bail!("unexpected workspace control response"),
                 }
             }
             "keep_window" => {
@@ -724,11 +774,15 @@ impl Server {
                 json!({"kept":true})
             }
             "finish_session" => {
-                let workspace = std::env::var("NIRI_MCP_WORKSPACE")
-                    .context("finishing a session requires workspace mode")?;
-                let finished = match request(Request::AgentFinish { workspace })? {
-                    Response::AgentFinished(finished) => finished,
-                    _ => bail!("unexpected finish response"),
+                let finished = if desktop.is_some() {
+                    desktop_control(niri_ipc::AgentDesktopAction::Finish)?.is_none()
+                } else {
+                    let workspace = std::env::var("NIRI_MCP_WORKSPACE")
+                        .context("finishing a session requires workspace mode")?;
+                    match request(Request::AgentFinish { workspace })? {
+                        Response::AgentFinished(finished) => finished,
+                        _ => bail!("unexpected finish response"),
+                    }
                 };
                 self.handoff = !finished;
                 self.invalidate();
@@ -1040,7 +1094,11 @@ fn shortcut(shortcut: &str) -> Result<Vec<AgentEvent>> {
 }
 
 /// Run a newline-delimited JSON-RPC MCP server until stdin closes.
-fn serve(mut input: impl BufRead + Send + 'static, automatic_workspace: bool) -> Result<()> {
+fn serve(
+    mut input: impl BufRead + Send + 'static,
+    automatic_workspace: bool,
+    desktop: bool,
+) -> Result<()> {
     let control = Arc::new(Mutex::new(Control::default()));
     CONTROL.with_borrow_mut(|value| *value = Some(control.clone()));
     let (send, receive) = mpsc::channel();
@@ -1088,10 +1146,10 @@ fn serve(mut input: impl BufRead + Send + 'static, automatic_workspace: bool) ->
         }
     });
     let specs = tools();
-    if !automatic_workspace {
+    let explicit_workspace = std::env::var("NIRI_MCP_WORKSPACE").ok();
+    if !automatic_workspace && (!desktop || explicit_workspace.is_some()) {
         request(Request::Windows).context("the selected compositor does not support agent IPC")?;
     }
-    let explicit_workspace = std::env::var("NIRI_MCP_WORKSPACE").ok();
     let mut servers: HashMap<String, Server> = HashMap::new();
     if let Some(connection) = CONNECTION.with_borrow_mut(Option::take) {
         servers.insert(
@@ -1184,7 +1242,17 @@ fn serve(mut input: impl BufRead + Send + 'static, automatic_workspace: bool) ->
                                         if let Some(workspace) = &workspace {
                                             std::env::set_var("NIRI_MCP_WORKSPACE", workspace);
                                         }
-                                        let key = workspace.unwrap_or_default();
+                                        let desktop_session = if desktop && workspace.is_none() {
+                                            Some(thread_workspace(params)?)
+                                        } else {
+                                            None
+                                        };
+                                        if let Some(session) = &desktop_session {
+                                            std::env::set_var("NIRI_MCP_DESKTOP_SESSION", session);
+                                        } else {
+                                            std::env::remove_var("NIRI_MCP_DESKTOP_SESSION");
+                                        }
+                                        let key = workspace.or(desktop_session).unwrap_or_default();
                                         active_server = Some(key.clone());
                                         if !servers.contains_key(&key)
                                             && servers.len() >= MAX_CONTEXTS

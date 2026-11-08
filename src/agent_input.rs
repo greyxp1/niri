@@ -48,8 +48,11 @@ pub struct AgentInputState {
     /// Idle input can be replaced by another session, but held input is exclusive.
     owner: Option<u64>,
     workspaces: HashMap<String, AgentWorkspaceState>,
+    desktop_sessions: HashSet<String>,
+    controls: HashMap<String, AgentControlState>,
+    desktop_owners: HashMap<u64, String>,
     launch_sockets: Vec<(Arc<AgentWorkspaceLaunch>, RegistrationToken)>,
-    workspace_indicator: bool,
+    indicator_visible: bool,
     /// Surface the agent pointer has entered.
     pointer: Option<WlSurface>,
     /// Surface the agent keyboard has entered, and its pressed evdev keycodes.
@@ -93,8 +96,15 @@ pub struct AgentInputState {
 
 #[derive(Debug)]
 struct AgentWorkspaceState {
-    info: niri_ipc::AgentWorkspace,
+    name: String,
+    id: u64,
     connections: HashSet<u64>,
+}
+
+#[derive(Debug, Default)]
+struct AgentControlState {
+    paused: bool,
+    reason: Option<String>,
     handoff_owner: Option<u64>,
 }
 
@@ -165,13 +175,65 @@ fn agent_window_ancestors(surface: &WlSurface) -> Vec<WlSurface> {
 }
 
 impl Niri {
+    pub fn check_desktop_session_access(&self, owner: u64) -> Result<(), String> {
+        if let Some(name) = self.agent_input.desktop_owners.get(&owner) {
+            if !self.agent_input.desktop_sessions.contains(name) {
+                return Err("desktop session is finished".into());
+            }
+            if self.agent_paused(name) {
+                return Err("desktop automation is paused".into());
+            }
+        }
+        Ok(())
+    }
+
+    fn agent_paused(&self, name: &str) -> bool {
+        self.agent_input
+            .controls
+            .get(name)
+            .is_some_and(|c| c.paused)
+    }
+
+    fn agent_handoff_for_other_session(&self, name: &str, owner: Option<u64>) -> bool {
+        self.agent_input
+            .controls
+            .get(name)
+            .and_then(|c| c.handoff_owner)
+            .is_some_and(|other| {
+                owner != Some(other)
+                    && (self.agent_input.desktop_owners.contains_key(&other)
+                        || self
+                            .agent_input
+                            .workspaces
+                            .values()
+                            .any(|w| w.connections.contains(&other)))
+            })
+    }
+
+    fn desktop_session_status(
+        &self,
+        name: &str,
+        owner: u64,
+    ) -> Option<niri_ipc::AgentDesktopSession> {
+        self.agent_input.desktop_sessions.contains(name).then(|| {
+            let control = &self.agent_input.controls[name];
+            niri_ipc::AgentDesktopSession {
+                name: name.to_owned(),
+                paused: control.paused,
+                reason: control.reason.clone(),
+                handoff_for_other_session: self.agent_handoff_for_other_session(name, Some(owner)),
+            }
+        })
+    }
+
     fn agent_handoff_pending(&self, entry: &AgentWorkspaceState) -> bool {
-        let id = WorkspaceId::specific(entry.info.id);
-        entry.info.paused
-            && (self
-                .layout
-                .find_workspace_by_id(id)
-                .is_some_and(|(_, workspace)| workspace.windows().next().is_some())
+        let id = WorkspaceId::specific(entry.id);
+        self.agent_paused(&entry.name)
+            && (self.agent_input.desktop_sessions.contains(&entry.name)
+                || self
+                    .layout
+                    .find_workspace_by_id(id)
+                    .is_some_and(|(_, workspace)| workspace.windows().next().is_some())
                 || self.unmapped_windows.keys().any(|surface| {
                     self.agent_launch_for_surface(surface)
                         .is_some_and(|launch| launch.workspace_id == id)
@@ -179,10 +241,12 @@ impl Niri {
     }
 
     pub fn agent_cleanup_needed(&self, name: &str) -> bool {
-        self.agent_input
-            .workspaces
-            .get(&name.to_ascii_lowercase())
-            .is_some_and(|entry| !self.agent_handoff_pending(entry))
+        (self.agent_input.desktop_sessions.contains(name) && !self.agent_paused(name))
+            || self
+                .agent_input
+                .workspaces
+                .get(&name.to_ascii_lowercase())
+                .is_some_and(|entry| !self.agent_handoff_pending(entry))
     }
 
     pub fn keep_agent_window(&mut self, window_id: u64, scope: Option<&str>) -> Result<(), String> {
@@ -203,7 +267,7 @@ impl Niri {
             self.agent_input
                 .workspaces
                 .get(&launch.name)
-                .is_some_and(|entry| !entry.info.paused)
+                .is_some_and(|entry| !self.agent_paused(&entry.name))
         }) {
             self.set_agent_window_retained(&root);
         }
@@ -225,7 +289,7 @@ impl Niri {
         if self.agent_handoff_pending(entry) {
             return Ok(());
         }
-        let id = WorkspaceId::specific(entry.info.id);
+        let id = WorkspaceId::specific(entry.id);
         if let Some((_, workspace)) = self.layout.find_workspace_by_id(id) {
             for window in workspace.windows() {
                 let surface = window.toplevel().wl_surface();
@@ -278,7 +342,7 @@ impl Niri {
             if let Some(entry) = self.agent_input.workspaces.get_mut(&name) {
                 if self
                     .layout
-                    .find_workspace_by_id(WorkspaceId::specific(entry.info.id))
+                    .find_workspace_by_id(WorkspaceId::specific(entry.id))
                     .is_some()
                 {
                     entry.connections.insert(owner);
@@ -298,22 +362,17 @@ impl Niri {
                 .1
                 .id()
                 .get();
+            self.agent_input.controls.entry(name.clone()).or_default();
             let entry = self
                 .agent_input
                 .workspaces
                 .entry(name.clone())
                 .or_insert_with(|| AgentWorkspaceState {
-                    info: niri_ipc::AgentWorkspace {
-                        name: name.clone(),
-                        id,
-                        paused: false,
-                        reason: None,
-                        handoff_for_other_session: false,
-                    },
+                    name: name.clone(),
+                    id,
                     connections: HashSet::new(),
-                    handoff_owner: None,
                 });
-            entry.info.id = id;
+            entry.id = id;
             entry.connections.insert(owner);
             self.agent_workspace_status(&name, Some(owner))
         } else {
@@ -323,7 +382,7 @@ impl Niri {
                 .get_mut(&name)
                 .ok_or("agent workspace is not reserved")?;
             entry.connections.remove(&owner);
-            Ok(entry.info.clone())
+            self.agent_workspace_status(&name, Some(owner))
         }
     }
 
@@ -337,20 +396,23 @@ impl Niri {
             .workspaces
             .get(&name.to_ascii_lowercase())
             .ok_or("agent workspace is not reserved")?;
-        let mut info = entry.info.clone();
         let (index, workspace) = self
             .layout
-            .find_workspace_by_id(WorkspaceId::specific(info.id))
+            .find_workspace_by_id(WorkspaceId::specific(entry.id))
             .ok_or("agent workspace no longer exists, reconnect the session")?;
-        info.name = workspace
-            .name()
-            .cloned()
-            .unwrap_or_else(|| (index + 1).to_string());
-        info.handoff_for_other_session = owner.is_some_and(|owner| {
-            entry
-                .handoff_owner
-                .is_some_and(|other| other != owner && entry.connections.contains(&other))
-        });
+        let control = &self.agent_input.controls[&entry.name];
+        let info = niri_ipc::AgentWorkspace {
+            name: workspace
+                .name()
+                .cloned()
+                .unwrap_or_else(|| (index + 1).to_string()),
+            id: entry.id,
+            paused: control.paused,
+            reason: control.reason.clone(),
+            handoff_for_other_session: owner.is_some_and(|owner| {
+                self.agent_handoff_for_other_session(&entry.name, Some(owner))
+            }),
+        };
         Ok(info)
     }
 
@@ -373,7 +435,7 @@ impl Niri {
             .agent_input
             .workspaces
             .values()
-            .any(|w| Some(w.info.id) == workspace && w.info.paused)
+            .any(|w| Some(w.id) == workspace && self.agent_paused(&w.name))
         {
             return Err("workspace automation is paused".into());
         }
@@ -387,7 +449,7 @@ impl Niri {
                 self.agent_input
                     .workspaces
                     .values()
-                    .any(|entry| entry.info.id == id.get())
+                    .any(|entry| entry.id == id.get())
             })
     }
 
@@ -805,6 +867,116 @@ fn same_client(surface: &WlSurface, client: &Client) -> bool {
 }
 
 impl State {
+    pub fn control_desktop_session(
+        &mut self,
+        name: String,
+        action: niri_ipc::AgentDesktopAction,
+        owner: u64,
+    ) -> Result<Option<niri_ipc::AgentDesktopSession>, String> {
+        use niri_ipc::AgentDesktopAction;
+        if name.is_empty() || name.len() > 64 || name != name.to_ascii_lowercase() {
+            return Err("invalid desktop session identity".into());
+        }
+        match action {
+            AgentDesktopAction::Status => {
+                self.niri
+                    .agent_input
+                    .controls
+                    .entry(name.clone())
+                    .or_default();
+                self.niri.agent_input.desktop_sessions.insert(name.clone());
+                self.niri
+                    .agent_input
+                    .desktop_owners
+                    .insert(owner, name.clone());
+            }
+            AgentDesktopAction::Finish => {
+                self.finish_agent_session(&name)?;
+            }
+            action => {
+                let reason = match action {
+                    AgentDesktopAction::Handoff { reason } => Some(reason),
+                    AgentDesktopAction::Resume => None,
+                    _ => unreachable!(),
+                };
+                if !self.niri.agent_input.desktop_sessions.contains(&name) {
+                    return Err("desktop session is not open".into());
+                }
+                if self.niri.agent_input.workspaces.contains_key(&name) {
+                    self.set_agent_workspace_control(&name, reason.is_some(), reason, Some(owner))?;
+                } else {
+                    self.set_agent_control(&name, reason.is_some(), reason, Some(owner))?;
+                }
+            }
+        }
+        self.refresh_agent_workspace_control();
+        Ok(self.niri.desktop_session_status(&name, owner))
+    }
+
+    fn set_agent_control(
+        &mut self,
+        name: &str,
+        paused: bool,
+        reason: Option<String>,
+        owner: Option<u64>,
+    ) -> Result<(), String> {
+        if reason
+            .as_ref()
+            .is_some_and(|reason| reason.trim().is_empty() || reason.chars().count() > 240)
+        {
+            return Err("handoff reason must contain 1 to 240 characters".into());
+        }
+        if self.niri.agent_handoff_for_other_session(name, owner) {
+            return Err("handoff belongs to another agent session".into());
+        }
+        let control = self
+            .niri
+            .agent_input
+            .controls
+            .get_mut(name)
+            .ok_or("agent session is not open")?;
+        control.handoff_owner = if paused && reason.is_some() {
+            owner
+        } else {
+            None
+        };
+        control.paused = paused;
+        control.reason = reason;
+        if paused {
+            self.cancel_desktop_requests(name);
+        }
+        Ok(())
+    }
+
+    fn cancel_desktop_requests(&mut self, name: &str) {
+        let owners: Vec<_> = self
+            .niri
+            .agent_input
+            .desktop_owners
+            .iter()
+            .filter(|(_, session)| session.as_str() == name)
+            .map(|(owner, _)| *owner)
+            .collect();
+        for owner in owners {
+            self.agent_cancel_requests(owner);
+        }
+    }
+
+    pub fn finish_agent_session(&mut self, name: &str) -> Result<bool, String> {
+        let name = name.to_ascii_lowercase();
+        if self.niri.agent_input.desktop_sessions.contains(&name) && self.niri.agent_paused(&name) {
+            return Ok(false);
+        }
+        if !self.finish_agent_workspace(&name)? {
+            return Ok(false);
+        }
+        self.cancel_desktop_requests(&name);
+        self.niri.agent_input.desktop_sessions.remove(&name);
+        self.niri.agent_input.controls.remove(&name);
+        self.refresh_agent_workspace_control();
+        Ok(true)
+    }
+
     pub fn retire_empty_agent_handoffs(&mut self) {
         let names: Vec<_> = self
             .niri
@@ -812,7 +984,7 @@ impl State {
             .workspaces
             .iter()
             .filter(|(_, entry)| {
-                entry.info.paused
+                self.niri.agent_paused(&entry.name)
                     && entry.connections.is_empty()
                     && !self.niri.agent_handoff_pending(entry)
             })
@@ -849,26 +1021,12 @@ impl State {
         reason: Option<String>,
         owner: Option<u64>,
     ) -> Result<niri_ipc::AgentWorkspace, String> {
-        let entry = self
-            .niri
-            .agent_input
-            .workspaces
-            .get_mut(&name.to_ascii_lowercase())
-            .ok_or("agent workspace is not reserved")?;
-        if entry
-            .handoff_owner
-            .is_some_and(|other| Some(other) != owner && entry.connections.contains(&other))
-        {
-            return Err("handoff belongs to another agent session".into());
+        let name = name.to_ascii_lowercase();
+        if !self.niri.agent_input.workspaces.contains_key(&name) {
+            return Err("agent workspace is not reserved".into());
         }
-        entry.handoff_owner = if paused && reason.is_some() {
-            owner
-        } else {
-            None
-        };
-        entry.info.paused = paused;
-        entry.info.reason = reason;
-        let info = entry.info.clone();
+        self.set_agent_control(&name, paused, reason, owner)?;
+        let info = self.niri.agent_workspace_status(&name, owner)?;
         let windows: Vec<_> = self
             .niri
             .layout
@@ -935,24 +1093,28 @@ impl State {
             }
         }
         self.niri.queue_redraw_all();
-        self.niri.agent_workspace_status(name, owner)
+        self.niri.agent_workspace_status(&name, owner)
     }
 
     pub fn refresh_agent_workspace_control(&mut self) {
         let visible = self
             .niri
-            .layout
-            .workspaces()
-            .any(|(monitor, index, workspace)| {
-                monitor.is_some_and(|m| m.active_workspace_idx() == index)
-                    && self.niri.agent_input.workspaces.values().any(|w| {
-                        w.info.id == workspace.id().get()
-                            && !w.info.paused
-                            && !w.connections.is_empty()
-                    })
-            });
-        if visible != self.niri.agent_input.workspace_indicator {
-            self.niri.agent_input.workspace_indicator = visible;
+            .agent_input
+            .desktop_sessions
+            .iter()
+            .any(|name| !self.niri.agent_paused(name))
+            || self
+                .niri
+                .layout
+                .workspaces()
+                .any(|(monitor, index, workspace)| {
+                    monitor.is_some_and(|m| m.active_workspace_idx() == index)
+                        && self.niri.agent_input.workspaces.values().any(|w| {
+                            w.id == workspace.id().get() && !self.niri.agent_paused(&w.name)
+                        })
+                });
+        if visible != self.niri.agent_input.indicator_visible {
+            self.niri.agent_input.indicator_visible = visible;
             self.niri.agent_indicator.session_changed(visible);
             self.niri.queue_redraw_all();
         }
@@ -980,6 +1142,11 @@ impl State {
     }
 
     pub fn agent_disconnect(&mut self, owner: u64) {
+        self.niri.agent_input.desktop_owners.remove(&owner);
+        self.agent_cancel_requests(owner);
+    }
+
+    fn agent_cancel_requests(&mut self, owner: u64) {
         self.agent_release_input(owner);
         self.niri.agent_input.shots.retain(|shot| {
             if shot.owner != owner {
@@ -996,6 +1163,9 @@ impl State {
         window_id: u64,
         events: Vec<AgentEvent>,
     ) -> Result<(), String> {
+        if !is_agent_cleanup(&events) {
+            self.niri.check_desktop_session_access(owner)?;
+        }
         if events.is_empty() {
             self.niri.check_agent_workspace_access(window_id, None)?;
             if self.niri.is_locked() {
@@ -1730,6 +1900,7 @@ impl State {
         show_pointer: bool,
         done: async_channel::Sender<Result<AgentScreenshotInfo, String>>,
     ) -> Result<(), String> {
+        self.niri.check_desktop_session_access(owner)?;
         self.niri
             .check_agent_workspace_access(window_id, workspace.as_deref())?;
         if self.niri.is_locked() {
@@ -2096,16 +2267,17 @@ impl Niri {
             keep
         });
         let launches = &self.agent_input.launch_sockets;
+        let controls = &self.agent_input.controls;
         self.agent_input.workspaces.retain(|name, entry| {
-            let keep = entry.info.paused
+            let keep = controls.get(&entry.name).is_some_and(|c| c.paused)
                 || !entry.connections.is_empty()
                 || launches.iter().any(|(launch, _)| launch.name == *name)
                 || self
                     .layout
-                    .find_workspace_by_id(WorkspaceId::specific(entry.info.id))
+                    .find_workspace_by_id(WorkspaceId::specific(entry.id))
                     .is_some_and(|(_, workspace)| workspace.windows().next().is_some());
             if !keep {
-                let id = WorkspaceId::specific(entry.info.id);
+                let id = WorkspaceId::specific(entry.id);
                 let configured =
                     self.layout
                         .find_workspace_by_id(id)
@@ -2126,6 +2298,9 @@ impl Niri {
             keep
         });
         let state = &mut self.agent_input;
+        state.controls.retain(|name, _| {
+            state.workspaces.contains_key(name) || state.desktop_sessions.contains(name)
+        });
         state
             .windows
             .retain(|_, t| t.elapsed() < AGENT_DRIVEN_TIMEOUT);

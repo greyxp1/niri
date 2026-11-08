@@ -62,6 +62,7 @@ struct ClientCtx {
     event_streams: Rc<RefCell<Vec<EventStreamSender>>>,
     event_stream_state: Rc<RefCell<EventStreamState>>,
     agent_session: bool,
+    desktop_session: Option<String>,
     agent_workspace: Option<String>,
 }
 
@@ -205,6 +206,7 @@ fn on_new_ipc_client(state: &mut State, stream: UnixStream) {
         event_streams: ipc_server.event_streams.clone(),
         event_stream_state: ipc_server.event_stream_state.clone(),
         agent_session: false,
+        desktop_session: None,
         agent_workspace: None,
     };
 
@@ -257,6 +259,15 @@ async fn handle_client(
         if let Ok(Request::AgentWorkspace { workspace }) = &request {
             ctx.agent_workspace = Some(workspace.clone());
         }
+        if let Ok(Request::AgentDesktopSession { session, .. }) = &request {
+            anyhow::ensure!(
+                ctx.desktop_session
+                    .as_ref()
+                    .is_none_or(|name| name == session),
+                "desktop session identity changed"
+            );
+            ctx.desktop_session = Some(session.clone());
+        }
         if matches!(request, Ok(Request::AgentSession)) {
             ctx.agent_session = true;
             ctx.event_loop.insert_idle(|state| {
@@ -274,7 +285,11 @@ async fn handle_client(
                 };
                 (reply, payload, true)
             }
-            Ok(request) if ctx.agent_session || ctx.agent_workspace.is_some() => {
+            Ok(request)
+                if ctx.agent_session
+                    || ctx.agent_workspace.is_some()
+                    || ctx.desktop_session.is_some() =>
+            {
                 let mut disconnected = [0];
                 let reply = select_biased! {
                     result = process(&ctx, request).fuse() => result,
@@ -546,6 +561,23 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             Response::FocusedOutput(output)
         }
         Request::EventStream | Request::AgentSession => Response::Handled,
+        Request::AgentDesktopSession { session, action } => {
+            let (tx, rx) = async_channel::bounded(1);
+            let alive = ctx.alive.clone();
+            let owner = ctx.owner;
+            ctx.event_loop.insert_idle(move |state| {
+                if !alive.get() {
+                    return;
+                }
+                let result = state.control_desktop_session(session, action, owner);
+                let _ = tx.send_blocking(result);
+            });
+            Response::AgentDesktopSession(
+                rx.recv()
+                    .await
+                    .map_err(|_| "error controlling desktop session".to_owned())??,
+            )
+        }
         Request::OverviewState => {
             let state = ctx.event_stream_state.borrow();
             let is_open = state.overview.is_open;
@@ -574,7 +606,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                 if !alive.get() {
                     return;
                 }
-                let _ = tx.send_blocking(state.finish_agent_workspace(&workspace));
+                let _ = tx.send_blocking(state.finish_agent_session(&workspace));
             });
             Response::AgentFinished(
                 rx.recv()
@@ -622,9 +654,6 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
         Request::AgentHandoff { ref workspace, .. } | Request::AgentResume { ref workspace } => {
             let workspace = workspace.clone();
             let reason = if let Request::AgentHandoff { reason, .. } = request {
-                if reason.trim().is_empty() || reason.chars().count() > 240 {
-                    return Err("handoff reason must contain 1 to 240 characters".into());
-                }
                 Some(reason)
             } else {
                 None
@@ -655,8 +684,13 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
             }
             let (tx, rx) = async_channel::bounded(1);
             let alive = ctx.alive.clone();
+            let owner = ctx.owner;
             ctx.event_loop.insert_idle(move |state| {
                 if !alive.get() {
+                    return;
+                }
+                if let Err(error) = state.niri.check_desktop_session_access(owner) {
+                    let _ = tx.send_blocking(Err(error));
                     return;
                 }
                 let launch = if let Some(name) = &workspace {
