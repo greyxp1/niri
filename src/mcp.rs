@@ -110,6 +110,29 @@ const MAX_IMAGE: usize = 2 * 1024 * 1024;
 const MAX_SIDE: u32 = 1920;
 const MAX_CONTEXTS: usize = 32;
 
+fn connect(timeout: Duration) -> Result<Socket> {
+    let mut socket = Socket::connect()?;
+    socket.set_timeout(Some(timeout))?;
+    CONTROL.with_borrow(|control| -> Result<()> {
+        if let Some(control) = control {
+            control.lock().unwrap().shutdown = Some(socket.shutdown_handle()?);
+        }
+        Ok(())
+    })?;
+    ensure!(!cancelled(), "request cancelled");
+    let Response::Version(compositor) =
+        socket.send(Request::Version)?.map_err(anyhow::Error::msg)?
+    else {
+        bail!("unexpected compositor version response");
+    };
+    let client = crate::utils::version();
+    ensure!(
+        compositor == client,
+        "Niri compositor {compositor} and computer-use client {client} differ. Restart your Niri session after rebuilding before using computer use."
+    );
+    Ok(socket)
+}
+
 pub fn check_cleanup() -> Result<()> {
     let mut input = Vec::new();
     io::stdin().take(MAX_REQUEST + 1).read_to_end(&mut input)?;
@@ -122,8 +145,7 @@ pub fn check_cleanup() -> Result<()> {
     let params = json!({"_meta":{"threadId":hook["session_id"]}});
     let workspace = thread_workspace(&params)?;
     session::desktop_environment()?;
-    let mut socket = Socket::connect()?;
-    socket.set_timeout(Some(Duration::from_secs(2)))?;
+    let mut socket = connect(Duration::from_secs(2))?;
     let response = socket
         .send(Request::AgentCleanupCheck { workspace })?
         .map_err(anyhow::Error::msg)?;
@@ -169,17 +191,7 @@ fn request(request: Request) -> Result<Response> {
     ensure!(!cancelled(), "request cancelled");
     CONNECTION.with_borrow_mut(|connection| {
         if connection.is_none() {
-            let mut socket = Socket::connect()?;
-            socket.set_timeout(Some(Duration::from_secs(15)))?;
-            CONTROL.with_borrow(|control| -> Result<()> {
-                control
-                    .as_ref()
-                    .context("MCP control is not initialized")?
-                    .lock()
-                    .unwrap()
-                    .shutdown = Some(socket.shutdown_handle()?);
-                Ok(())
-            })?;
+            let mut socket = connect(Duration::from_secs(15))?;
             ensure!(!cancelled(), "request cancelled");
             socket
                 .send(if let Ok(workspace) = std::env::var("NIRI_MCP_WORKSPACE") {
@@ -291,6 +303,39 @@ impl Target {
             Self::Layer(l) => Some(&l.namespace),
         }
     }
+
+    fn is_chromium(&self) -> bool {
+        let app_id = self.app_id().unwrap_or_default().to_lowercase();
+        [
+            "chrome", "chromium", "helium", "brave", "vivaldi", "edge", "electron",
+        ]
+        .iter()
+        .any(|name| app_id.contains(name))
+    }
+
+    fn is_browser(&self) -> bool {
+        let app_id = self.app_id().unwrap_or_default().to_lowercase();
+        self.is_chromium()
+            || ["firefox", "librewolf"]
+                .iter()
+                .any(|name| app_id.contains(name))
+    }
+}
+
+fn text_event(window: &Target, args: &Value) -> Result<AgentEvent> {
+    let text = string(args, "text")?.to_owned();
+    ensure!(text.len() <= 64 * 1024, "text exceeds 64 KiB");
+    let unicode_input = match args.get("unicode_input").map(Value::as_str) {
+        Some(Some("keymap")) => AgentUnicodeInput::Keymap,
+        Some(Some("ctrl_shift_u")) => AgentUnicodeInput::CtrlShiftU,
+        None if window.is_chromium() => AgentUnicodeInput::CtrlShiftU,
+        None => AgentUnicodeInput::Keymap,
+        _ => bail!("unsupported Unicode input method"),
+    };
+    Ok(AgentEvent::Text {
+        text,
+        unicode_input,
+    })
 }
 
 fn layers() -> Result<Vec<niri_ipc::LayerSurface>> {
@@ -374,7 +419,7 @@ fn tools() -> Vec<Value> {
     let modifiers = json!({"type":"array","items":{"enum":["Ctrl","Shift","Alt","Super"]},"maxItems":4,"uniqueItems":true});
     let tools = vec![
         tool("get_session_state", "Read the host, workspace and pause state.", json!({}), &[], true),
-        tool("request_handoff", "Pause automation for human help. Tell the user what to do in the agent workspace, then wait for their confirmation.", json!({"reason":text}), &["reason"], false),
+        tool("request_handoff", "Pause automation for human help. Tell the user what to do in the agent workspace, then wait for their confirmation.", json!({"reason":{"type":"string","minLength":1,"maxLength":240}}), &["reason"], false),
         tool("resume_session", "Resume workspace automation only after the user explicitly returns control, for example by saying done in chat. Inspect the app again before continuing.", json!({}), &[], false),
         tool("keep_window", "Keep an agent window after the task finishes, when the user asks to keep it or needs its result.", json!({"window_id":id}), &["window_id"], false),
         tool("finish_session", "Close unclaimed agent windows and release the workspace when computer use is finished. Pending human handoffs are preserved.", json!({}), &[], false),
@@ -387,7 +432,7 @@ fn tools() -> Vec<Value> {
         tool("click", "Click within an explicitly targeted window. Coordinates use its latest screenshot. Optional modifiers are held only for this gesture. No foreground fallback.", json!({"window_id":id,"x":coordinate,"y":coordinate,"button":{"enum":["left","middle","right"]},"click_count":{"type":"integer","minimum":1,"maximum":3},"modifiers":modifiers}), &["window_id","x","y"], false),
         tool("scroll", "Scroll within one exact window at the specified screenshot coordinates. Deltas are logical pixels, positive down and right. Optional modifiers are held only for this gesture.", json!({"window_id":id,"x":coordinate,"y":coordinate,"vertical":{"type":"number"},"horizontal":{"type":"number"},"modifiers":modifiers}), &["window_id","x","y","vertical"], false),
         tool("drag", "Press, move and release within one exact window using screenshot coordinates. Optional modifiers are held only for this gesture.", json!({"window_id":id,"start_x":coordinate,"start_y":coordinate,"end_x":coordinate,"end_y":coordinate,"modifiers":modifiers}), &["window_id","start_x","start_y","end_x","end_y"], false),
-        tool("type_text", "Type literal text into one window's current editable element without changing real focus. A different foreground window of the same Wayland client causes refusal. Prefer set_value when an editable accessibility element is available.", json!({"window_id":id,"text":text,"unicode_input":{"enum":["keymap","ctrl_shift_u"]}}), &["window_id","text"], false),
+        tool("type_text", "Insert text into an explicit editable element using snapshot_id and element_index. Browser input requires these selectors. Other apps may use their current keyboard target. Prefer set_value to replace a field.", json!({"window_id":id,"text":text,"snapshot_id":id,"element_index":id,"unicode_input":{"enum":["keymap","ctrl_shift_u"]}}), &["window_id","text"], false),
         tool("press_key", "Press and release physical keyboard keys, for example Ctrl+A, Return, Escape or Alt+Left. Letter positions use the US evdev layout. No focus changes or global input fallback.", json!({"window_id":id,"key":text}), &["window_id","key"], false),
     ];
     #[cfg(feature = "dbus")]
@@ -844,30 +889,28 @@ impl Server {
             "press_key" | "type_text" => {
                 let window = target(args)?;
                 let id = window.id();
-                let events = if name == "type_text" {
-                    let text = string(args, "text")?.to_owned();
-                    ensure!(text.len() <= 64 * 1024, "text exceeds 64 KiB");
-                    let app_id = window.app_id().unwrap_or_default().to_lowercase();
-                    let chromium = [
-                        "chrome", "chromium", "helium", "brave", "vivaldi", "edge", "electron",
-                    ]
-                    .iter()
-                    .any(|name| app_id.contains(name));
-                    let unicode_input = match args.get("unicode_input").map(Value::as_str) {
-                        Some(Some("keymap")) => AgentUnicodeInput::Keymap,
-                        Some(Some("ctrl_shift_u")) => AgentUnicodeInput::CtrlShiftU,
-                        None if !chromium => AgentUnicodeInput::Keymap,
-                        None => AgentUnicodeInput::CtrlShiftU,
-                        _ => bail!("unsupported Unicode input method"),
-                    };
-                    vec![AgentEvent::Text {
-                        text,
-                        unicode_input,
-                    }]
+                if name == "type_text" {
+                    ensure!(
+                        string(args, "text")?.len() <= 64 * 1024,
+                        "text exceeds 64 KiB"
+                    );
+                }
+                if name == "type_text"
+                    && (args.get("snapshot_id").is_some() || args.get("element_index").is_some())
+                {
+                    #[cfg(feature = "dbus")]
+                    self.accessibility.act(&window, name, args)?;
+                    #[cfg(not(feature = "dbus"))]
+                    bail!("Niri was built without accessibility support");
                 } else {
-                    shortcut(string(args, "key")?)?
-                };
-                self.input(id, events)?;
+                    let events = if name == "type_text" {
+                        ensure!(!window.is_browser(), "Browser text requires snapshot_id and element_index from get_app_state. Verify the intended field before entering text.");
+                        vec![text_event(&window, args)?]
+                    } else {
+                        shortcut(string(args, "key")?)?
+                    };
+                    self.input(id, events)?;
+                }
                 json!({"delivered":true})
             }
             #[cfg(feature = "dbus")]

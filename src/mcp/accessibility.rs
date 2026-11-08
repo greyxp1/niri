@@ -93,6 +93,45 @@ async fn proxy<'a>(
         .await?)
 }
 
+async fn action_names(action: &Proxy<'_>) -> Result<Vec<String>> {
+    let count: i32 = action.get_property("NActions").await?;
+    let mut names = Vec::new();
+    for index in 0..count.clamp(0, 64) {
+        names.push(action.call("GetName", &(index,)).await?);
+    }
+    Ok(names)
+}
+
+async fn contains(connection: &Connection, root: &ObjectRefOwned, target: &ObjectRefOwned) -> bool {
+    let mut queue = VecDeque::from([(root.clone(), 0)]);
+    let mut seen = HashSet::new();
+    while let Some((reference, depth)) = queue.pop_front() {
+        if reference.is_null() || !seen.insert(reference.clone()) {
+            continue;
+        }
+        if &reference == target {
+            return true;
+        }
+        if depth == 64 {
+            continue;
+        }
+        let Ok(accessible) = reference.as_accessible_proxy(connection).await else {
+            continue;
+        };
+        let Ok(children) = accessible.get_children().await else {
+            continue;
+        };
+        let remaining = 2000usize.saturating_sub(seen.len() + queue.len());
+        queue.extend(
+            children
+                .into_iter()
+                .take(remaining)
+                .map(|child| (child, depth + 1)),
+        );
+    }
+    false
+}
+
 async fn root(connection: &Connection, window: &Target) -> Result<ObjectRefOwned> {
     let pid = u32::try_from(window.pid().context("window has no process ID")?)?;
     let title = window
@@ -105,8 +144,11 @@ async fn root(connection: &Connection, window: &Target) -> Result<ObjectRefOwned
         .build()
         .await?;
     let dbus = zbus::fdo::DBusProxy::new(connection).await?;
-    let mut matches = Vec::new();
+    let mut matches = HashSet::new();
     for app in registry.get_children().await?.into_iter().take(256) {
+        if app.is_null() {
+            continue;
+        }
         let Some(name) = app.name() else { continue };
         if dbus
             .get_connection_unix_process_id(name.clone().into())
@@ -117,11 +159,19 @@ async fn root(connection: &Connection, window: &Target) -> Result<ObjectRefOwned
             continue;
         }
         let app_proxy = app.as_accessible_proxy(connection).await?;
-        for index in 0..app_proxy.child_count().await?.clamp(0, 256) {
-            let candidate = app_proxy.get_child_at_index(index).await?;
+        let Ok(count) = app_proxy.child_count().await else {
+            continue;
+        };
+        for index in 0..count.clamp(0, 256) {
+            let Ok(candidate) = app_proxy.get_child_at_index(index).await else {
+                continue;
+            };
+            if candidate.is_null() {
+                continue;
+            }
             let accessible = candidate.as_accessible_proxy(connection).await?;
             if accessible.name().await.ok().as_deref() == Some(title) {
-                matches.push(candidate);
+                matches.insert(candidate);
             }
         }
     }
@@ -130,7 +180,7 @@ async fn root(connection: &Connection, window: &Target) -> Result<ObjectRefOwned
         "expected one accessibility window matching PID and title, found {}",
         matches.len()
     );
-    Ok(matches.remove(0))
+    Ok(matches.into_iter().next().unwrap())
 }
 
 #[derive(Serialize)]
@@ -156,6 +206,14 @@ async fn snapshot(
     max_nodes: usize,
     max_depth: usize,
 ) -> Result<(Vec<Node>, bool)> {
+    let origin = match proxy(connection, root, "org.a11y.atspi.Component").await {
+        Ok(component) => component
+            .call::<_, _, (i32, i32, i32, i32)>("GetExtents", &(CoordType::Screen,))
+            .await
+            .ok()
+            .map(|(x, y, _, _)| (x, y)),
+        Err(_) => None,
+    };
     let mut queue = VecDeque::from([(root.clone(), None, 0)]);
     let mut seen = HashSet::new();
     let mut nodes = Vec::new();
@@ -165,14 +223,22 @@ async fn snapshot(
             continue;
         }
         let accessible = reference.as_accessible_proxy(connection).await?;
-        let interfaces = accessible.get_interfaces().await?;
-        let (role, name, description, states, count) = futures_util::try_join!(
+        let metadata = futures_util::try_join!(
+            accessible.get_interfaces(),
             accessible.get_role_name(),
             accessible.name(),
             accessible.description(),
             accessible.get_state(),
             accessible.child_count()
-        )?;
+        );
+        let (interfaces, role, name, description, states, count) = match metadata {
+            Ok(metadata) => metadata,
+            Err(error) if depth == 0 => return Err(error.into()),
+            Err(_) => {
+                truncated = true;
+                continue;
+            }
+        };
         let index = nodes.len();
         let mut node = Node {
             element_index: index,
@@ -199,19 +265,25 @@ async fn snapshot(
         if interfaces.contains(Interface::Component) {
             let component = proxy(connection, &reference, "org.a11y.atspi.Component").await?;
             if let Ok((x, y, width, height)) = component
-                .call::<_, _, (i32, i32, i32, i32)>("GetExtents", &(CoordType::Window,))
+                .call::<_, _, (i32, i32, i32, i32)>("GetExtents", &(CoordType::Screen,))
                 .await
             {
-                node.bounds = Some(
-                    json!({"x":x,"y":y,"width":width,"height":height,"coordinate_space":"window-logical"}),
-                );
+                if let Some((ox, oy)) = origin {
+                    // Embedded browser documents use their own origin for Window coordinates.
+                    node.bounds = Some(
+                        json!({"x":i64::from(x)-i64::from(ox),"y":i64::from(y)-i64::from(oy),"width":width,"height":height,"coordinate_space":"window-logical"}),
+                    );
+                }
             }
         }
         if interfaces.contains(Interface::Action) {
             let action = proxy(connection, &reference, "org.a11y.atspi.Action").await?;
-            let actions: Vec<atspi::Action> =
-                action.call("GetActions", &()).await.unwrap_or_default();
-            node.actions = actions.into_iter().map(|action| action.name).collect();
+            node.actions = action_names(&action)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|name| !name.is_empty())
+                .collect();
         }
         if interfaces.contains(Interface::Value) {
             node.value = proxy(connection, &reference, "org.a11y.atspi.Value")
@@ -235,6 +307,7 @@ async fn snapshot(
             }
         }
     }
+    ensure!(!nodes.is_empty(), "accessibility root disappeared");
     Ok((nodes, truncated))
 }
 
@@ -320,38 +393,23 @@ impl Accessibility {
             );
             let accessible = node.reference.as_accessible_proxy(&connection).await?;
             ensure!(
-                accessible.name().await? == node.name
-                    && accessible.get_role_name().await? == node.role,
+                accessible.name().await.ok().as_ref() == Some(&node.name)
+                    && accessible.get_role_name().await.ok().as_ref() == Some(&node.role),
                 "element changed, refresh get_app_state"
             );
-            let mut ancestor = node.reference.clone();
-            let mut contained = false;
-            for _ in 0..=64 {
-                if ancestor == snapshot.root {
-                    contained = true;
-                    break;
-                }
-                if ancestor.is_null() {
-                    break;
-                }
-                ancestor = ancestor
-                    .as_accessible_proxy(&connection)
-                    .await?
-                    .parent()
-                    .await?;
-            }
+            // Chromium can expose valid children with stale parent references.
             ensure!(
-                contained,
+                contains(&connection, &snapshot.root, &node.reference).await,
                 "element no longer belongs to the requested window"
             );
             if tool == "perform_action" {
                 let name = string(args, "action")?;
                 let action = proxy(&connection, &node.reference, "org.a11y.atspi.Action").await?;
-                let actions: Vec<atspi::Action> = action.call("GetActions", &()).await?;
+                let actions = action_names(&action).await?;
                 let matching: Vec<_> = actions
                     .iter()
                     .enumerate()
-                    .filter(|(_, a)| a.name == name)
+                    .filter(|(_, action)| !name.is_empty() && action.as_str() == name)
                     .collect();
                 ensure!(
                     matching.len() == 1,
@@ -361,15 +419,63 @@ impl Accessibility {
                 let done: bool = action.call("DoAction", &(matching[0].0 as i32,)).await?;
                 ensure!(done, "application declined the accessibility action");
             } else {
-                let value = string(args, "value")?;
+                let value = string(args, if tool == "type_text" { "text" } else { "value" })?;
                 let interfaces = accessible.get_interfaces().await?;
                 if interfaces.contains(Interface::EditableText) {
                     let editable =
                         proxy(&connection, &node.reference, "org.a11y.atspi.EditableText").await?;
                     check_unlocked(window)?;
-                    let done: bool = editable.call("SetTextContents", &(value,)).await?;
+                    let done: bool = if tool == "type_text" {
+                        let text =
+                            proxy(&connection, &node.reference, "org.a11y.atspi.Text").await?;
+                        let selections: i32 = text.call("GetNSelections", &()).await?;
+                        ensure!(
+                            (0..=1).contains(&selections),
+                            "element has multiple text selections"
+                        );
+                        let position: i32 = if selections == 1 {
+                            let (start, end): (i32, i32) =
+                                text.call("GetSelection", &(0i32,)).await?;
+                            ensure!(start >= 0 && end >= start, "invalid text selection");
+                            check_unlocked(window)?;
+                            let deleted: bool = editable.call("DeleteText", &(start, end)).await?;
+                            ensure!(deleted, "application declined the selection replacement");
+                            start
+                        } else {
+                            text.get_property("CaretOffset").await?
+                        };
+                        check_unlocked(window)?;
+                        let count = i32::try_from(value.chars().count())?;
+                        let end = position
+                            .checked_add(count)
+                            .filter(|_| position >= 0)
+                            .context("invalid text caret offset")?;
+                        let inserted: bool = editable
+                            .call("InsertText", &(position, value, -1i32))
+                            .await?;
+                        if inserted {
+                            let _: bool = text.call("SetCaretOffset", &(end,)).await?;
+                        }
+                        inserted
+                    } else {
+                        editable.call("SetTextContents", &(value,)).await?
+                    };
                     ensure!(done, "application declined the text replacement");
-                } else if interfaces.contains(Interface::Value) {
+                } else if tool == "type_text" && interfaces.contains(Interface::Text) {
+                    let states = accessible.get_state().await?;
+                    ensure!(
+                        node.states.contains(&atspi::State::Focused)
+                            && states.contains(atspi::State::Focused)
+                            && states.contains(atspi::State::Editable),
+                        "This application requires keyboard text input. Focus the requested editable field and refresh get_app_state before typing."
+                    );
+                    super::request(niri_ipc::Request::AgentInput {
+                        geometry: None,
+                        workspace: std::env::var("NIRI_MCP_WORKSPACE").ok(),
+                        window_id: window.id(),
+                        events: vec![super::text_event(window, args)?],
+                    })?;
+                } else if tool != "type_text" && interfaces.contains(Interface::Value) {
                     let value: f64 = value.parse()?;
                     ensure!(value.is_finite(), "numeric value must be finite");
                     let target =
