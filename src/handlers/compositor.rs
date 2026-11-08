@@ -185,16 +185,7 @@ impl CompositorHandler for State {
                         }
                     });
 
-                    let agent_workspace_id = activation_token_data
-                        .as_ref()
-                        .and_then(|token| {
-                            token
-                                .user_data
-                                .get::<std::sync::Arc<crate::agent_input::AgentWorkspaceLaunch>>()
-                        })
-                        .map(|launch| launch.workspace_id)
-                        .or_else(|| self.niri.agent_workspace_for_client(surface))
-                        .filter(|id| self.niri.layout.find_workspace_by_id(*id).is_some());
+                    let agent_workspace_id = self.niri.agent_workspace_for_client(surface);
                     let workspace_id = agent_workspace_id.or(workspace_id);
 
                     // New windows of a client driven by agent input, or launched by an agent
@@ -222,7 +213,13 @@ impl CompositorHandler for State {
                         _ => activate,
                     };
 
-                    let activate = if agent_workspace_id.is_some() {
+                    let agent_activation = activation_token_data.as_ref().is_some_and(|token| {
+                        matches!(
+                            token.user_data.get::<crate::handlers::UrgentOnlyMarker>(),
+                            Some(crate::handlers::UrgentOnlyMarker::Agent)
+                        )
+                    });
+                    let activate = if agent_workspace_id.is_some() || agent_activation {
                         ActivateWindow::No
                     } else {
                         activate
