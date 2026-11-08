@@ -1096,7 +1096,7 @@ impl State {
     pub fn send_initial_configure(&mut self, toplevel: &ToplevelSurface) {
         let _span = tracy_client::span!("State::send_initial_configure");
 
-        let client_workspace = self.niri.agent_workspace_for_client(toplevel.wl_surface());
+        let workspace = self.niri.agent_workspace_for_client(toplevel.wl_surface());
         let Some(unmapped) = self.niri.unmapped_windows.get_mut(toplevel.wl_surface()) else {
             error!("window must be present in unmapped_windows in send_initial_configure()");
             return;
@@ -1109,16 +1109,6 @@ impl State {
             self.niri.is_at_startup,
         );
 
-        let workspace = unmapped
-            .activation_token_data
-            .as_ref()
-            .and_then(|token| {
-                token
-                    .user_data
-                    .get::<std::sync::Arc<crate::agent_input::AgentWorkspaceLaunch>>()
-            })
-            .map(|launch| launch.workspace_id)
-            .or(client_workspace);
         if let Some(id) = workspace {
             rules.open_on_workspace = self
                 .niri

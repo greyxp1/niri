@@ -761,6 +761,22 @@ impl XdgActivationHandler for State {
         if self.niri.agent_input.issued(serial) {
             debug!("downgrading xdg-activation token with an agent input serial to urgency");
             data.user_data.insert_if_missing(|| UrgentOnlyMarker::Agent);
+            if let Some(source) = data.surface.as_ref() {
+                if let Some(launch) = self.niri.agent_launch_for_surface(source).filter(|launch| {
+                    self.niri.agent_workspace_for_client(source) == Some(launch.workspace_id)
+                }) {
+                    // A shared client can open a parentless window through this token. Carry
+                    // the source's ownership without adopting existing personal windows.
+                    data.user_data.insert_if_missing(|| {
+                        Arc::new(crate::agent_input::AgentWorkspaceLaunch {
+                            name: launch.name.clone(),
+                            workspace_id: launch.workspace_id,
+                            existing: self.niri.agent_existing_surfaces(),
+                            created: data.timestamp,
+                        })
+                    });
+                }
+            }
             return true;
         }
 
@@ -801,22 +817,27 @@ impl XdgActivationHandler for State {
             if let Some(launch) = token_data
                 .user_data
                 .get::<Arc<crate::agent_input::AgentWorkspaceLaunch>>()
+                .filter(|launch| {
+                    !launch.existing.contains(&surface.id())
+                        && self
+                            .niri
+                            .agent_workspace_status(&launch.name, None)
+                            .is_ok_and(|info| info.id == launch.workspace_id.get())
+                })
             {
                 let window = self
                     .niri
                     .layout
                     .find_window_and_output(&surface)
                     .map(|(w, _)| w.id().get());
-                if window.is_none_or(|id| !launch.existing.contains(&id)) {
-                    with_states(&surface, |states| {
-                        *states
-                            .data_map
-                            .get_or_insert_threadsafe(|| Mutex::new(launch.clone()))
-                            .lock()
-                            .unwrap() = launch.clone();
-                    });
-                }
-                if let Some(id) = window.filter(|id| !launch.existing.contains(id)) {
+                with_states(&surface, |states| {
+                    *states
+                        .data_map
+                        .get_or_insert_threadsafe(|| Mutex::new(launch.clone()))
+                        .lock()
+                        .unwrap() = launch.clone();
+                });
+                if let Some(id) = window {
                     self.do_action(
                         niri_config::Action::MoveWindowToWorkspaceById {
                             window_id: id,

@@ -26,7 +26,7 @@ use smithay::desktop::{
 use smithay::input::keyboard::{xkb, Keycode, KeymapFile};
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::RegistrationToken;
-use smithay::reexports::wayland_server::backend::ClientId;
+use smithay::reexports::wayland_server::backend::{ClientId, ObjectId};
 use smithay::reexports::wayland_server::protocol::wl_keyboard::{KeyState, KeymapFormat};
 use smithay::reexports::wayland_server::protocol::wl_pointer::{Axis, ButtonState};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -112,7 +112,7 @@ struct AgentControlState {
 pub struct AgentWorkspaceLaunch {
     pub(crate) name: String,
     pub(crate) workspace_id: WorkspaceId,
-    pub(crate) existing: HashSet<u64>,
+    pub(crate) existing: HashSet<ObjectId>,
     pub(crate) created: Instant,
 }
 
@@ -300,7 +300,7 @@ impl Niri {
                 }) && self
                     .agent_launch_for_surface(surface)
                     .is_some_and(|launch| {
-                        launch.workspace_id == id && !launch.existing.contains(&window.id().get())
+                        launch.workspace_id == id && !launch.existing.contains(&surface.id())
                     })
                 {
                     window.toplevel().send_close();
@@ -451,6 +451,23 @@ impl Niri {
                     .values()
                     .any(|entry| entry.id == id.get())
             })
+    }
+
+    #[allow(
+        clippy::mutable_key_type,
+        reason = "ObjectId hashes identity, independent of its liveness flag"
+    )]
+    pub fn agent_existing_surfaces(&self) -> HashSet<ObjectId> {
+        // Surface identity survives unmapping, unlike the layout's window ID.
+        self.unmapped_windows
+            .keys()
+            .map(Resource::id)
+            .chain(
+                self.layout
+                    .windows()
+                    .map(|(_, w)| w.toplevel().wl_surface().id()),
+            )
+            .collect()
     }
 
     pub fn agent_launch_display(
@@ -2266,11 +2283,18 @@ impl Niri {
             }
             keep
         });
+        let pending_workspaces: HashSet<_> = self
+            .unmapped_windows
+            .keys()
+            .filter_map(|surface| self.agent_launch_for_surface(surface))
+            .map(|launch| launch.workspace_id.get())
+            .collect();
         let launches = &self.agent_input.launch_sockets;
         let controls = &self.agent_input.controls;
         self.agent_input.workspaces.retain(|name, entry| {
             let keep = controls.get(&entry.name).is_some_and(|c| c.paused)
                 || !entry.connections.is_empty()
+                || pending_workspaces.contains(&entry.id)
                 || launches.iter().any(|(launch, _)| launch.name == *name)
                 || self
                     .layout

@@ -29,6 +29,7 @@ use smithay::reexports::calloop::generic::Generic;
 use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
 use smithay::reexports::calloop::{Interest, LoopHandle, Mode, PostAction};
 use smithay::reexports::rustix::fs::unlink;
+use smithay::reexports::wayland_server::Resource;
 use smithay::utils::SERIAL_COUNTER;
 use smithay::wayland::shell::wlr_layer::{KeyboardInteractivity, Layer};
 
@@ -695,12 +696,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                     Some(Arc::new(crate::agent_input::AgentWorkspaceLaunch {
                         name: name.to_ascii_lowercase(),
                         workspace_id: WorkspaceId::specific(info.id),
-                        existing: state
-                            .niri
-                            .layout
-                            .windows()
-                            .map(|(_, w)| w.id().get())
-                            .collect(),
+                        existing: state.niri.agent_existing_surfaces(),
                         created: Instant::now(),
                     }))
                 } else {
@@ -743,7 +739,7 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
                             }
                             let windows: Vec<_> = state.niri.layout.windows()
                                 .filter(|(_, window)| {
-                                    !launch.existing.contains(&window.id().get())
+                                    !launch.existing.contains(&window.toplevel().wl_surface().id())
                                         && state.niri.agent_launch_for_surface(window.toplevel().wl_surface())
                                             .is_some_and(|other| Arc::ptr_eq(&other, &launch))
                                         && state.niri.check_agent_workspace_access(
