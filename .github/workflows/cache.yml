@@ -58,9 +58,5 @@ jobs:
                 self = source;
                 nixpkgs = inputs.nixpkgs;
               };
-              outputs = (import (nixconf.outPath + "/flake.nix")).outputs {
-                self = nixconf;
-                tackOverrides = { inherit niri; };
-              };
-            in outputs.nixosConfigurations.desktop.config.programs.niri.package
+            in niri.packages.x86_64-linux.niri
           '
