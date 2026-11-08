@@ -1277,7 +1277,7 @@ impl State {
                 .any(|event| matches!(event, AgentEvent::Key { .. } | AgentEvent::Text { .. }))
         {
             return Err(String::from(
-                "another window of this client has the real keyboard focus",
+                "another window of this client has the real keyboard focus. Use accessibility or request a handoff. Do not focus windows or switch workspaces through shell commands to bypass this refusal",
             ));
         }
         self.agent_mark_window(window_id);
