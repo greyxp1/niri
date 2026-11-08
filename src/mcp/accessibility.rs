@@ -352,6 +352,12 @@ impl Accessibility {
         let connection = self.connection()?;
         let (root, nodes, truncated) = bounded(async {
             let root = root(&connection, window).await?;
+            // Chromium activates web accessibility when clients request attributes.
+            let _ = root
+                .as_accessible_proxy(&connection)
+                .await?
+                .get_attributes()
+                .await;
             let (nodes, truncated) =
                 snapshot(&connection, &root, max_nodes as usize, max_depth as usize).await?;
             Ok((root, nodes, truncated))
