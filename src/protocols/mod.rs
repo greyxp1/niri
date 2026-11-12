@@ -12,3 +12,5 @@ pub mod raw;
 /// Same as Smithay's `GlobalData` which we can't use due to coherence.
 #[derive(Debug)]
 pub struct EmptyData;
+
+pub mod surface_blur;

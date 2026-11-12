@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="zgrey_blur_v1">
+  <copyright>Copyright © 2026 grey
+
+Permission to use, copy, modify, and distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.</copyright>
+  <interface name="zgrey_blur_manager_v1" version="1">
+    <description summary="private grouped live backdrop blur">
+      This private protocol applies independently adjustable blur regions to a
+      layer surface. It always samples the live content below the surface,
+      overriding per-layer background-effect rules and ext-background-effect while
+      its committed region list is nonempty. The global blur off setting remains
+      authoritative. Other surface roles are unaffected.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="get_surface">
+      <arg name="id" type="new_id" interface="zgrey_blur_surface_v1"/>
+      <arg name="surface" type="object" interface="wl_surface"/>
+    </request>
+    <enum name="error">
+      <entry name="already_exists" value="0" summary="surface already has a blur object"/>
+    </enum>
+  </interface>
+  <interface name="zgrey_blur_surface_v1" version="1">
+    <description summary="commit synchronized grouped blur regions">
+      Each array contains native-endian 32-bit records of x, y, width, height,
+      strength, coverage. Coordinates are signed surface-local 24.8 fixed-point
+      logical coordinates. Width and height must be positive and their endpoints
+      must fit signed 32-bit
+      coordinates. Strength is an unsigned integer from 1 through 64 logical
+      pixels controlling the approximate blur kernel extent. Coverage is an unsigned
+      integer from 1 through 16, where 16 is fully covered.
+
+      Rectangles must not overlap. Clients resolve annotation overlaps before
+      submission. At most 65536 rectangles may be pending. Each array request
+      must fit the Wayland message size limit and may be split with append_regions.
+
+      Updates are applied with the next wl_surface.commit. An empty list restores
+      the standard background effect. Destroying this object clears its regions
+      on the next surface commit. Destroying the wl_surface makes this object inert.
+    </description>
+    <request name="destroy" type="destructor"/>
+    <request name="set_regions">
+      <arg name="regions" type="array"/>
+    </request>
+    <request name="append_regions">
+      <arg name="regions" type="array"/>
+    </request>
+    <enum name="error">
+      <entry name="invalid_regions" value="0" summary="invalid region records"/>
+    </enum>
+  </interface>
+</protocol>

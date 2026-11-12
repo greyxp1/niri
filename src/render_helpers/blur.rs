@@ -28,6 +28,17 @@ pub struct BlurOptions {
     pub offset: f64,
 }
 
+impl BlurOptions {
+    pub fn from_strength(strength: u32, scale: f64) -> Self {
+        let extent = f64::from(strength) * scale;
+        let passes = (extent.max(1.).log2().floor() as u8).clamp(1, 8);
+        Self {
+            passes,
+            offset: extent / f64::from((1u32 << (passes + 1)) - 2),
+        }
+    }
+}
+
 impl From<niri_config::Blur> for BlurOptions {
     fn from(config: niri_config::Blur) -> Self {
         Self {
@@ -157,8 +168,7 @@ impl Blur {
             self.textures.push(texture);
         }
 
-        // Drop any no longer needed textures.
-        self.textures.drain(passes + 1..);
+        // Retain smaller levels for later strengths without reallocating each frame.
 
         Ok(())
     }
@@ -181,7 +191,7 @@ impl Blur {
         let size = source.size();
 
         ensure!(
-            self.textures.len() == passes + 1,
+            self.textures.len() > passes,
             "wrong textures len: expected {}, got {}",
             passes + 1,
             self.textures.len()
@@ -228,8 +238,8 @@ impl Blur {
                 vertices.as_ptr().cast(),
             );
 
-            let src = once(source).chain(&self.textures[1..]);
-            let dst = &self.textures[1..];
+            let src = once(source).chain(&self.textures[1..=passes]);
+            let dst = &self.textures[1..=passes];
             for (src, dst) in zip(src, dst) {
                 let dst_size = dst.size();
                 let w = dst_size.w;
@@ -288,8 +298,8 @@ impl Blur {
                 vertices.as_ptr().cast(),
             );
 
-            let src = self.textures.iter().rev();
-            let dst = self.textures.iter().rev().skip(1);
+            let src = self.textures[..=passes].iter().rev();
+            let dst = self.textures[..=passes].iter().rev().skip(1);
             for (src, dst) in zip(src, dst) {
                 let dst_size = dst.size();
                 let w = dst_size.w;

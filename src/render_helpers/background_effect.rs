@@ -301,6 +301,59 @@ pub fn render_for_tile(
         let background_effect = SurfaceBackgroundEffect::get(states);
         let mut background_effect = background_effect.0.lock().unwrap();
 
+        let groups = crate::protocols::surface_blur::current(states);
+        if !groups.is_empty()
+            && states.role == Some(smithay::wayland::shell::wlr_layer::LAYER_SURFACE_ROLE)
+            && !should_block_out
+        {
+            if blur_config.off {
+                return;
+            }
+            let mut surface_geometry = surface_geo(states).unwrap_or_default().to_f64();
+            surface_geometry.loc += surface_off;
+            surface_geometry = surface_geometry.upscale(surface_anim_scale);
+            surface_geometry.loc += geometry.loc;
+            let groups: Vec<_> = groups
+                .iter()
+                .map(|group| {
+                    (
+                        BlurOptions::from_strength(group.strength, scale),
+                        group
+                            .regions
+                            .iter()
+                            .map(|(coverage, rectangles)| {
+                                (
+                                    *coverage as f32 / 16.,
+                                    TransformedRegion {
+                                        rects: rectangles.clone(),
+                                        scale: (
+                                            surface_anim_scale.x / 256.,
+                                            surface_anim_scale.y / 256.,
+                                        )
+                                            .into(),
+                                        offset: surface_geometry.loc,
+                                    },
+                                )
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            let params = RenderParams {
+                geometry: surface_geometry,
+                subregion: None,
+                clip: None,
+                scale,
+            };
+            push(
+                background_effect
+                    .nonxray
+                    .render_grouped(ns, params, groups)
+                    .into(),
+            );
+            return;
+        }
+
         let blur_region = get_cached_blur_region(states);
         let has_blur_region = blur_region.as_ref().is_some_and(|r| !r.is_empty());
 

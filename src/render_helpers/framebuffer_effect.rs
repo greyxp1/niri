@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::sync::Once;
+use std::sync::{Arc, Once};
 
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
@@ -37,6 +37,7 @@ pub struct FramebufferEffectElement {
     subregion: Option<TransformedRegion>,
     scale: f32,
     blur_options: Option<BlurOptions>,
+    groups: Vec<(BlurOptions, Vec<(f32, TransformedRegion)>)>,
     noise: f32,
     saturation: f32,
 }
@@ -88,9 +89,20 @@ impl FramebufferEffect {
             subregion: params.subregion,
             scale: params.scale as f32,
             blur_options,
+            groups: Vec::new(),
             noise,
             saturation,
         }
+    }
+    pub fn render_grouped(
+        &self,
+        ns: Option<usize>,
+        params: RenderParams,
+        groups: Vec<(BlurOptions, Vec<(f32, TransformedRegion)>)>,
+    ) -> FramebufferEffectElement {
+        let mut element = self.render(ns, params, None, 0., 1.);
+        element.groups = groups;
+        element
     }
 }
 
@@ -126,6 +138,85 @@ impl FramebufferEffectElement {
             Uniform::new("saturation", self.saturation),
             Uniform::new("bg_color", [0f32, 0., 0., 0.]),
         ]
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn draw_texture(
+        &self,
+        frame: &mut GlesFrame<'_, '_>,
+        src: Rectangle<f64, Buffer>,
+        dst: Rectangle<i32, Physical>,
+        damage: &[Rectangle<i32, Physical>],
+        texture: &GlesTexture,
+        subregion: Option<&TransformedRegion>,
+        filtered: &mut Vec<Rectangle<i32, Physical>>,
+        alpha: f32,
+    ) -> Result<(), GlesError> {
+        // Clamp the same way as in capture_framebuffer().
+        let output_rect = Rectangle::from_size(frame.output_size());
+        let clamped_dst = match dst.intersection(output_rect) {
+            Some(clamped) => clamped,
+            None => return Ok(()),
+        };
+        let clamp_offset = clamped_dst.loc - dst.loc;
+
+        // Filter damage by subregion, reusing the stored Vec to avoid allocation.
+
+        filtered.clear();
+
+        if let Some(subregion) = subregion {
+            // Convert to subregion coordinates.
+            let mut crop = src.to_logical(1., Transform::Normal, &src.size);
+            crop.loc += self.geometry.loc;
+            subregion.filter_damage(crop, dst, damage, filtered);
+        } else {
+            filtered.extend(damage.iter());
+        };
+
+        // Adjust for clamped dst.
+        if clamped_dst != dst {
+            let r = Rectangle::new(clamp_offset, clamped_dst.size);
+            filtered.retain_mut(|d| {
+                if let Some(mut crop) = d.intersection(r) {
+                    crop.loc -= clamp_offset;
+                    *d = crop;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+
+        if filtered.is_empty() {
+            return Ok(());
+        }
+        let damage = &filtered[..];
+
+        // Adjust src proportionally to the dst clamping.
+        let src_loc = src.loc.to_logical(1., Transform::Normal, &src.size);
+        let dst_to_src = src.size / dst.size.to_f64();
+        let crop = Rectangle::new(
+            src_loc + clamp_offset.to_f64().upscale(dst_to_src).to_logical(1.),
+            clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
+        );
+
+        let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
+        let uniforms = program
+            .is_some()
+            .then(|| self.compute_uniforms(crop, frame.transformation()));
+        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
+
+        frame.render_texture_from_to(
+            texture,
+            Rectangle::from_size(texture.size().to_f64()),
+            clamped_dst,
+            damage,
+            &[],
+            // The intermediate texture has the same transform as the frame.
+            frame.transformation().invert(),
+            alpha,
+            program.as_ref(),
+            uniforms,
+        )
     }
 }
 
@@ -346,75 +437,86 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
         let mut inner = inner.borrow_mut();
         let inner = &mut *inner;
 
+        if !self.groups.is_empty() {
+            let Inner {
+                framebuffer,
+                blur,
+                subregion_damage,
+                ..
+            } = &mut *inner;
+            let (Some(source), Some(blur)) = (framebuffer.as_ref(), blur.as_mut()) else {
+                return Ok(());
+            };
+            // Every group reads the same captured backdrop. Draw each result before
+            // reusing the pyramid, so storage stays independent of strength count.
+            for (options, regions) in &self.groups {
+                let texture = {
+                    let mut guard = frame.renderer();
+                    let renderer = guard.as_mut();
+                    if let Err(err) = blur.prepare_textures(
+                        |fourcc, size| renderer.create_buffer(fourcc, size),
+                        source,
+                        *options,
+                    ) {
+                        warn!("error preparing grouped blur: {err:?}");
+                        continue;
+                    }
+                    match blur.render(renderer, source, *options) {
+                        Ok(texture) => texture,
+                        Err(err) => {
+                            warn!("error rendering grouped blur: {err:?}");
+                            continue;
+                        }
+                    }
+                };
+                // A stroke can contain thousands of scanline rectangles. They all
+                // sample the same blurred texture, so render one damage pass per
+                // coverage level instead of one GPU draw per rectangle.
+                let mut merged: Vec<(f32, TransformedRegion)> = Vec::new();
+                for (alpha, region) in regions {
+                    if let Some((_, combined)) =
+                        merged.iter_mut().find(|(existing, _)| *existing == *alpha)
+                    {
+                        Arc::make_mut(&mut combined.rects).extend(region.rects.iter().copied());
+                    } else {
+                        merged.push((
+                            *alpha,
+                            TransformedRegion {
+                                rects: Arc::new(region.rects.as_ref().clone()),
+                                scale: region.scale,
+                                offset: region.offset,
+                            },
+                        ));
+                    }
+                }
+                for (alpha, region) in &merged {
+                    self.draw_texture(
+                        frame,
+                        src,
+                        dst,
+                        damage,
+                        &texture,
+                        Some(region),
+                        subregion_damage,
+                        *alpha,
+                    )?;
+                }
+            }
+            return Ok(());
+        }
         let Some(texture) = &inner.intermediate else {
             return Ok(());
         };
 
-        // Clamp the same way as in capture_framebuffer().
-        let output_rect = Rectangle::from_size(frame.output_size());
-        let clamped_dst = match dst.intersection(output_rect) {
-            Some(clamped) => clamped,
-            None => return Ok(()),
-        };
-        let clamp_offset = clamped_dst.loc - dst.loc;
-
-        // Filter damage by subregion, reusing the stored Vec to avoid allocation.
-        let filtered = &mut inner.subregion_damage;
-        filtered.clear();
-
-        if let Some(subregion) = &self.subregion {
-            // Convert to subregion coordinates.
-            let mut crop = src.to_logical(1., Transform::Normal, &src.size);
-            crop.loc += self.geometry.loc;
-            subregion.filter_damage(crop, dst, damage, filtered);
-        } else {
-            filtered.extend(damage.iter());
-        };
-
-        // Adjust for clamped dst.
-        if clamped_dst != dst {
-            let r = Rectangle::new(clamp_offset, clamped_dst.size);
-            filtered.retain_mut(|d| {
-                if let Some(mut crop) = d.intersection(r) {
-                    crop.loc -= clamp_offset;
-                    *d = crop;
-                    true
-                } else {
-                    false
-                }
-            });
-        }
-
-        if filtered.is_empty() {
-            return Ok(());
-        }
-        let damage = &filtered[..];
-
-        // Adjust src proportionally to the dst clamping.
-        let src_loc = src.loc.to_logical(1., Transform::Normal, &src.size);
-        let dst_to_src = src.size / dst.size.to_f64();
-        let crop = Rectangle::new(
-            src_loc + clamp_offset.to_f64().upscale(dst_to_src).to_logical(1.),
-            clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
-        );
-
-        let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
-        let uniforms = program
-            .is_some()
-            .then(|| self.compute_uniforms(crop, frame.transformation()));
-        let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
-
-        frame.render_texture_from_to(
-            texture,
-            Rectangle::from_size(texture.size().to_f64()),
-            clamped_dst,
+        self.draw_texture(
+            frame,
+            src,
+            dst,
             damage,
-            &[],
-            // The intermediate texture has the same transform as the frame.
-            frame.transformation().invert(),
+            texture,
+            self.subregion.as_ref(),
+            &mut inner.subregion_damage,
             1.,
-            program.as_ref(),
-            uniforms,
         )
     }
 }
