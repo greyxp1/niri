@@ -75,6 +75,8 @@ pub struct WindowRule {
     #[knuffel(child)]
     pub default_floating_position: Option<FloatingPosition>,
     #[knuffel(child, unwrap(argument))]
+    pub resize_anchor: Option<ResizeAnchor>,
+    #[knuffel(child, unwrap(argument))]
     pub scroll_factor: Option<FloatOrInt<0, 100>>,
     #[knuffel(child, unwrap(argument))]
     pub pinch_sensitivity: Option<FloatOrInt<0, 100>>,
@@ -94,6 +96,13 @@ pub enum VrrRule {
     On,
     /// Enable VRR when the window is the current fullscreen window.
     FullscreenOnly,
+}
+
+#[derive(knuffel::DecodeScalar, Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum ResizeAnchor {
+    #[default]
+    TopLeft,
+    Center,
 }
 
 /// Rules for popup surfaces.

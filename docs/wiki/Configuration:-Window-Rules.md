@@ -776,6 +776,20 @@ window-rule {
 }
 ```
 
+#### `resize-anchor`
+
+Set which point stays fixed when a floating window changes size.
+The default is `"top-left"`. Use `"center"` to preserve its center, including during resize animations.
+Interactive resizing keeps the opposite edge fixed.
+Window positions remain constrained to keep part of the window on screen.
+
+```kdl
+window-rule {
+    match app-id="^perch$"
+    resize-anchor "center"
+}
+```
+
 #### `scroll-factor`
 
 <sup>Since: 25.02</sup>
