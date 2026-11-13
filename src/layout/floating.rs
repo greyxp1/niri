@@ -3,6 +3,7 @@ use std::iter::zip;
 use std::rc::Rc;
 
 use niri_config::utils::MergeWith as _;
+use niri_config::window_rule::ResizeAnchor;
 use niri_config::{PresetSize, RelativeTo};
 use niri_ipc::{PositionChange, SizeChange, WindowLayout};
 use smithay::backend::renderer::gles::GlesRenderer;
@@ -91,6 +92,9 @@ struct Data {
     /// Cached actual size of the tile.
     size: Size<f64, Logical>,
 
+    /// Whether the current resize animation preserves the center.
+    center_resize: bool,
+
     /// Working area used for conversions.
     working_area: Rectangle<f64, Logical>,
 }
@@ -105,6 +109,7 @@ impl Data {
             pos: Point::default(),
             logical_pos: Point::default(),
             size: Size::default(),
+            center_resize: false,
             working_area,
         };
         rv.update(tile);
@@ -187,6 +192,14 @@ impl Data {
 
     pub fn center(&self) -> Point<f64, Logical> {
         self.logical_pos + self.size.downscale(2.)
+    }
+
+    fn render_offset<W: LayoutElement>(&self, tile: &Tile<W>) -> Point<f64, Logical> {
+        let mut offset = tile.render_offset();
+        if self.center_resize {
+            offset += (self.size.to_point() - tile.animated_tile_size().to_point()).downscale(2.);
+        }
+        offset
     }
 
     #[cfg(test)]
@@ -273,7 +286,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         layer: RenderLayer,
     ) {
         let active = self.active_window_id.clone();
-        for (tile, offset) in self.tiles_with_offsets_mut() {
+        for (tile, pos) in self.tiles_with_render_positions_mut(false) {
             // Skip tiles belonging to a different render layer.
             if layer.is_normal() == tile.is_moving_between_workspaces() {
                 continue;
@@ -283,7 +296,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
             let is_active = is_active && Some(id) == active.as_ref();
 
             let mut tile_view_rect = view_rect;
-            tile_view_rect.loc -= offset + tile.render_offset();
+            tile_view_rect.loc -= pos;
             tile.update_render_elements(is_active, tile_view_rect);
         }
     }
@@ -312,8 +325,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         &self,
     ) -> impl Iterator<Item = (&Tile<W>, Point<f64, Logical>)> {
         let scale = self.scale;
-        self.tiles_with_offsets().map(move |(tile, offset)| {
-            let pos = offset + tile.render_offset();
+        zip(&self.tiles, &self.data).map(move |(tile, data)| {
+            let pos = data.logical_pos + data.render_offset(tile);
             // Round to physical pixels.
             let pos = pos.to_physical_precise_round(scale).to_logical(scale);
             (tile, pos)
@@ -325,8 +338,8 @@ impl<W: LayoutElement> FloatingSpace<W> {
         round: bool,
     ) -> impl Iterator<Item = (&mut Tile<W>, Point<f64, Logical>)> {
         let scale = self.scale;
-        self.tiles_with_offsets_mut().map(move |(tile, offset)| {
-            let mut pos = offset + tile.render_offset();
+        zip(&mut self.tiles, &self.data).map(move |(tile, data)| {
+            let mut pos = data.logical_pos + data.render_offset(tile);
             // Round to physical pixels.
             if round {
                 pos = pos.to_physical_precise_round(scale).to_logical(scale);
@@ -1046,6 +1059,7 @@ impl<W: LayoutElement> FloatingSpace<W> {
         }
 
         let prev_size = data.size;
+        let prev_pos = data.logical_pos;
 
         tile.update_window();
         data.update(tile);
@@ -1060,6 +1074,17 @@ impl<W: LayoutElement> FloatingSpace<W> {
                 offset.y += prev_size.h - data.size.h;
             }
             data.set_logical_pos(data.logical_pos + offset);
+        } else if prev_size != data.size
+            && tile.window().rules().resize_anchor == ResizeAnchor::Center
+        {
+            data.set_logical_pos(
+                prev_pos + (prev_size.to_point() - data.size.to_point()).downscale(2.),
+            );
+        }
+
+        if prev_size != data.size {
+            data.center_resize =
+                resize.is_none() && tile.window().rules().resize_anchor == ResizeAnchor::Center;
         }
 
         true
