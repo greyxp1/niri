@@ -2404,6 +2404,7 @@ mod tests {
                             relative_to: BottomLeft,
                         },
                     ),
+                    resize_anchor: None,
                     scroll_factor: None,
                     pinch_sensitivity: Some(
                         FloatOrInt(
