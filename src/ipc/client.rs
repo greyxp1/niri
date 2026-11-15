@@ -272,7 +272,7 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
             let mut iter = layers.iter().peekable();
 
             let print = |surface: &niri_ipc::LayerSurface| {
-                println!("    Surface:");
+                println!("    Surface ID {}:", surface.id);
                 println!("      Namespace: \"{}\"", surface.namespace);
 
                 let interactivity = match surface.keyboard_interactivity {
@@ -562,6 +562,9 @@ pub fn handle_msg(mut msg: Msg, json: bool, print_request: bool) -> anyhow::Resu
                     }
                     Event::TouchpadToggled { on } => {
                         println!("Touchpad enabled: {on}");
+                    }
+                    Event::AgentInputActivity { window_id, kind } => {
+                        println!("Agent input activity: window {window_id}: {kind:?}");
                     }
                 }
             }

@@ -15,6 +15,8 @@
         {
           lib,
           cairo,
+          bubblewrap,
+          at-spi2-core,
           dbus,
           libGL,
           libdisplay-info_0_3,
@@ -23,6 +25,7 @@
           libxkbcommon,
           libgbm,
           pango,
+          mesa,
           pipewire,
           pkg-config,
           rustPlatform,
@@ -38,6 +41,7 @@
         rustPlatform.buildRustPackage {
           pname = "niri";
           version = revision;
+          passthru.mcpCompletionCleanup = true;
 
           src = lib.fileset.toSource {
             root = ./.;
@@ -141,6 +145,12 @@
               ]
             );
             NIRI_BUILD_COMMIT = revision;
+            NIRI_MCP_BWRAP = lib.getExe bubblewrap;
+            NIRI_MCP_DBUS_DAEMON = "${dbus}/bin/dbus-daemon";
+            NIRI_MCP_SYSTEMCTL = "${systemd}/bin/systemctl";
+            NIRI_MCP_DATA_DIR = "${at-spi2-core}/share";
+            NIRI_MCP_EGL_VENDOR = "${mesa}/share/glvnd/egl_vendor.d/50_mesa.json";
+            NIRI_MCP_VULKAN_DRIVERS = "${mesa}/share/vulkan/icd.d";
           };
 
           passthru = {

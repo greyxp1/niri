@@ -546,7 +546,6 @@ impl State {
             |this, mods, keysym| {
                 let key_code = keysym.raw_code();
                 let modifiers = modifiers_from_state(*mods);
-
                 // When resolving a bind, we can try three keysyms:
                 // - modified: the actual final keysym we got by pressing this key
                 // - raw: keysym from the 0th layer of the current layout (usually lowercase letter)
@@ -759,18 +758,28 @@ impl State {
             return;
         };
 
-        if result.should_forward() {
-            // Forward the key to client.
-            keyboard.input_forward(
-                self,
-                event.key_code(),
-                event.state(),
-                serial,
-                time,
-                mods_changed,
-            );
-        } else if mods_changed {
-            keyboard.advertise_modifier_state(self);
+        // Forward the event to the client, unless the key was intercepted.
+        match &result {
+            ShouldInterceptResult::Forward | ShouldInterceptResult::ForwardAndHandle(_) => {
+                if pressed && !mods_changed {
+                    if let Some(surface) = keyboard.current_focus() {
+                        self.niri.keep_agent_surface(&surface);
+                    }
+                }
+                keyboard.input_forward(
+                    self,
+                    event.key_code(),
+                    event.state(),
+                    serial,
+                    time,
+                    mods_changed,
+                );
+            }
+            ShouldInterceptResult::InterceptAndHandle(_) | ShouldInterceptResult::InterceptOnly => {
+                if mods_changed {
+                    keyboard.advertise_modifier_state(self);
+                }
+            }
         }
 
         // Handle the bind, if the result came with one.
@@ -3473,6 +3482,11 @@ impl State {
             }
         }
 
+        if button_state == ButtonState::Pressed {
+            if let Some(surface) = pointer.current_focus() {
+                self.niri.keep_agent_surface(&surface);
+            }
+        }
         pointer.button(
             self,
             &ButtonEvent {
@@ -3906,6 +3920,11 @@ impl State {
             }
         }
 
+        if horizontal_amount != 0.0 || vertical_amount != 0.0 {
+            if let Some(surface) = pointer.current_focus() {
+                self.niri.keep_agent_surface(&surface);
+            }
+        }
         pointer.axis(self, frame);
         pointer.frame(self);
     }
@@ -4123,6 +4142,11 @@ impl State {
                     }
                 }
 
+                if let Some(pos) = self.niri.tablet_cursor_location {
+                    if let Some((surface, _)) = self.niri.contents_under(pos).surface {
+                        self.niri.keep_agent_surface(&surface);
+                    }
+                }
                 tool.down(self, &tablet::tool::DownEvent { serial, time });
             }
             TabletToolTipState::Up => {
@@ -4655,7 +4679,7 @@ impl State {
 
         let serial = SERIAL_COUNTER.next_serial();
 
-        let under = self.niri.contents_under(pos);
+        let under = self.niri.contents_under_without_agent_hold(pos);
 
         let mod_key = self.backend.mod_key(&self.niri.config.borrow());
         let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
@@ -4758,6 +4782,9 @@ impl State {
             self.niri.focus_layer_surface_if_on_demand(under.layer);
         };
 
+        if let Some((surface, _)) = &under.surface {
+            self.niri.keep_agent_surface(surface);
+        }
         handle.down(
             self,
             under.surface,
