@@ -75,6 +75,8 @@ impl CompositorHandler for State {
             return;
         }
 
+        self.agent_root_committed(&root_surface);
+
         if surface == &root_surface {
             // This is a root surface commit. It might have mapped a previously-unmapped toplevel.
             if let Entry::Occupied(entry) = self.niri.unmapped_windows.entry(surface.clone()) {
@@ -160,7 +162,15 @@ impl CompositorHandler for State {
                     let activate = activate.unwrap_or_else(|| {
                         // Check the token timestamp again in case the window took a while between
                         // requesting activation and mapping.
-                        let token = activation_token_data.filter(|token| {
+                        if activation_token_data.as_ref().is_some_and(|token| {
+                            token
+                                .user_data
+                                .get::<crate::handlers::UrgentOnlyMarker>()
+                                .is_some()
+                        }) {
+                            return ActivateWindow::No;
+                        }
+                        let token = activation_token_data.as_ref().filter(|token| {
                             token.timestamp.elapsed() < XDG_ACTIVATION_TOKEN_TIMEOUT
                         });
                         if token.is_some() {
@@ -175,6 +185,45 @@ impl CompositorHandler for State {
                         }
                     });
 
+                    let agent_workspace_id = self.niri.agent_workspace_for_client(surface);
+                    let workspace_id = agent_workspace_id.or(workspace_id);
+
+                    // New windows of a client driven by agent input, or launched by an agent
+                    // (NIRI_AGENT_LAUNCH=1 in its environment), don't take the user's focus,
+                    // unless the user is working in that client.
+                    let activate = match surface.client() {
+                        Some(client)
+                            if (self.niri.agent_input.is_agent_driven(&client)
+                                || crate::agent_input::is_agent_launched(
+                                    &client,
+                                    &self.niri.display_handle,
+                                ))
+                                && !self
+                                    .niri
+                                    .seat
+                                    .get_keyboard()
+                                    .unwrap()
+                                    .current_focus()
+                                    .and_then(|f| f.client())
+                                    .is_some_and(|c| c.id() == client.id()) =>
+                        {
+                            debug!("not activating new window of an agent-driven client");
+                            ActivateWindow::No
+                        }
+                        _ => activate,
+                    };
+
+                    let agent_activation = activation_token_data.as_ref().is_some_and(|token| {
+                        matches!(
+                            token.user_data.get::<crate::handlers::UrgentOnlyMarker>(),
+                            Some(crate::handlers::UrgentOnlyMarker::Agent)
+                        )
+                    });
+                    let activate = if agent_workspace_id.is_some() || agent_activation {
+                        ActivateWindow::No
+                    } else {
+                        activate
+                    };
                     let parent = toplevel
                         .parent()
                         .and_then(|parent| self.niri.layout.find_window_and_output(&parent))
@@ -188,6 +237,15 @@ impl CompositorHandler for State {
                             parent_output.is_none()
                                 || output.is_none()
                                 || output.as_ref() == *parent_output
+                        })
+                        .filter(|(mapped, _)| {
+                            agent_workspace_id.is_none_or(|id| {
+                                self.niri.layout.find_workspace_by_id(id).is_some_and(
+                                    |(_, workspace)| {
+                                        workspace.windows().any(|w| w.id() == mapped.id())
+                                    },
+                                )
+                            })
                         })
                         .map(|(mapped, _)| mapped.window.clone());
 

@@ -99,6 +99,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Handle subcommands.
     if let Some(subcommand) = cli.subcommand {
         match subcommand {
+            Sub::Mcp {
+                check_cleanup,
+                isolated,
+                desktop,
+                headless,
+                workspace,
+            } => {
+                if check_cleanup {
+                    niri::mcp::check_cleanup()?;
+                    return Ok(());
+                }
+                niri::mcp::run(isolated, desktop, headless, workspace)?;
+                return Ok(());
+            }
             Sub::Validate { config } => {
                 tracy_client::Client::start();
 
@@ -188,11 +202,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_loop.handle(),
         event_loop.get_signal(),
         display,
-        false,
+        cli.headless.is_some(),
         true,
         cli.session,
     )
     .unwrap();
+
+    if let Some(size) = cli.headless {
+        state
+            .backend
+            .headless()
+            .start(&mut state.niri, (size.0, size.1))?;
+    }
 
     // Set WAYLAND_DISPLAY for children.
     let socket_name = state.niri.socket_name.as_deref().unwrap();

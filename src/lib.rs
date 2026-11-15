@@ -3,6 +3,7 @@ extern crate tracing;
 
 #[cfg(feature = "dbus")]
 pub mod a11y;
+pub mod agent_input;
 pub mod animation;
 pub mod backend;
 pub mod cli;
@@ -15,6 +16,7 @@ pub mod input;
 pub mod ipc;
 pub mod layer;
 pub mod layout;
+pub mod mcp;
 pub mod niri;
 pub mod protocols;
 pub mod render_helpers;

@@ -20,6 +20,17 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Clone the connection handle for cancelling a blocked request with `shutdown`.
+    pub fn shutdown_handle(&self) -> io::Result<UnixStream> {
+        self.stream.get_ref().try_clone()
+    }
+
+    /// Limit how long a blocking read or write may wait on the compositor.
+    pub fn set_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.get_ref().set_read_timeout(timeout)?;
+        self.stream.get_ref().set_write_timeout(timeout)
+    }
+
     /// Connects to the default niri IPC socket.
     ///
     /// This is equivalent to calling [`Self::connect_to`] with the path taken from the
