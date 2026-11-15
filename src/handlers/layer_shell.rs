@@ -1,6 +1,7 @@
 use smithay::desktop::{layer_map_for_output, LayerSurface, PopupKind, WindowSurfaceType};
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+use smithay::reexports::wayland_server::Resource;
 use smithay::wayland::compositor::{add_pre_commit_hook, get_parent, with_states, HookId};
 use smithay::wayland::shell::wlr_layer::{
     self, Layer, LayerSurface as WlrLayerSurface, LayerSurfaceCachedState, LayerSurfaceData,
@@ -124,7 +125,7 @@ impl State {
                 let scale = output.current_scale().fractional_scale();
 
                 let hook = add_mapped_layer_pre_commit_hook(layer);
-                let mapped = MappedLayer::new(
+                let mut mapped = MappedLayer::new(
                     layer.clone(),
                     hook,
                     rules,
@@ -133,6 +134,10 @@ impl State {
                     self.niri.clock.clone(),
                     &config,
                 );
+                mapped.agent_focus_suppressed = layer.wl_surface().client().is_some_and(|client| {
+                    self.niri.agent_input.is_agent_driven(&client)
+                        || crate::agent_input::is_agent_launched(&client, &self.niri.display_handle)
+                });
 
                 let prev = self
                     .niri
@@ -172,7 +177,14 @@ impl State {
             // https://github.com/niri-wm/niri/issues/641
             let on_demand = layer.cached_state().keyboard_interactivity
                 == wlr_layer::KeyboardInteractivity::OnDemand;
-            if was_unmapped && on_demand {
+            if was_unmapped
+                && on_demand
+                && !self
+                    .niri
+                    .mapped_layer_surfaces
+                    .get(layer)
+                    .is_some_and(|m| m.agent_focus_suppressed)
+            {
                 // I guess it'd make sense to check that no higher-layer on-demand surface
                 // has focus, but Smithay's Layer doesn't implement Ord so this would be a
                 // little annoying.

@@ -107,6 +107,8 @@ pub struct Workspace<W: LayoutElement> {
     /// Optional name of this workspace.
     pub(super) name: Option<String>,
 
+    pub(super) is_agent: bool,
+
     /// Layout config overrides for this workspace.
     layout_config: Option<niri_config::LayoutPart>,
 
@@ -274,6 +276,7 @@ impl<W: LayoutElement> Workspace<W> {
             base_options,
             options,
             name: config.map(|c| c.name.0),
+            is_agent: false,
             layout_config,
             id: WorkspaceId::next(),
         }
@@ -336,6 +339,7 @@ impl<W: LayoutElement> Workspace<W> {
             base_options,
             options,
             name: config.map(|c| c.name.0),
+            is_agent: false,
             layout_config,
             id: WorkspaceId::next(),
         }

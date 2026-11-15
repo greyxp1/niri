@@ -180,6 +180,7 @@ use crate::render_helpers::{
 };
 #[cfg(feature = "xdp-gnome-screencast")]
 use crate::screencasting::Screencasting;
+use crate::ui::agent_indicator::AgentIndicator;
 use crate::ui::config_error_notification::ConfigErrorNotification;
 use crate::ui::exit_confirm_dialog::{ExitConfirmDialog, ExitConfirmDialogRenderElement};
 use crate::ui::hotkey_overlay::HotkeyOverlay;
@@ -200,6 +201,9 @@ use crate::window::mapped::{MappedId, WindowCastRenderElements};
 use crate::window::{InitialConfigureState, Mapped, ResolvedWindowRules, Unmapped, WindowRef};
 
 const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
+
+pub(crate) type IpcScreenshotReply = Result<Option<Vec<u8>>, String>;
+pub type WindowPixels = (Size<i32, Physical>, (f64, Point<i32, Physical>), Vec<u8>);
 
 // We'll try to send frame callbacks at least once a second. We'll make a timer that fires once a
 // second, so with the worst timing the maximum interval between two frame callbacks for a surface
@@ -447,6 +451,7 @@ pub struct Niri {
     pub locked_hint: Option<bool>,
 
     pub screenshot_ui: ScreenshotUi,
+    pending_ipc_screenshot: Option<async_channel::Sender<IpcScreenshotReply>>,
     pub config_error_notification: ConfigErrorNotification,
     pub hotkey_overlay: HotkeyOverlay,
     pub exit_confirm_dialog: ExitConfirmDialog,
@@ -457,6 +462,8 @@ pub struct Niri {
     pub pending_mru_commit: Option<PendingMruCommit>,
 
     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
+    pub agent_input: crate::agent_input::AgentInputState,
+    pub agent_indicator: AgentIndicator,
     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
 
     pub debug_draw_opaque_regions: bool,
@@ -898,6 +905,8 @@ impl State {
         // screencasts.
         self.niri.refresh_mapped_cast_window_rules();
         self.ipc_refresh_casts();
+        // Should happen before refresh_window_rules().
+        self.niri.refresh_mapped_agent_state();
 
         self.niri.refresh_window_rules();
         self.refresh_ipc_outputs();
@@ -1322,6 +1331,7 @@ impl State {
     }
 
     pub fn update_keyboard_focus(&mut self) {
+        self.refresh_agent_workspace_control();
         // Clean up on-demand layer surface focus if necessary.
         if let Some(surface) = &self.niri.layer_shell_on_demand_focus {
             // Still alive and has on-demand interactivity.
@@ -1330,8 +1340,8 @@ impl State {
                     == wlr_layer::KeyboardInteractivity::OnDemand;
 
             if let Some(mapped) = self.niri.mapped_layer_surfaces.get(surface) {
-                // Check if it moved to the overview backdrop.
-                if mapped.place_within_backdrop() {
+                // Agent-driven layers wait for explicit user interaction to regain focus.
+                if mapped.place_within_backdrop() || mapped.agent_focus_suppressed {
                     good = false;
                 }
             } else {
@@ -1391,7 +1401,7 @@ impl State {
                     }
 
                     let mapped = self.niri.mapped_layer_surfaces.get(surface)?;
-                    if mapped.place_within_backdrop() {
+                    if mapped.place_within_backdrop() || mapped.agent_focus_suppressed {
                         return None;
                     }
 
@@ -2255,9 +2265,9 @@ impl State {
         self.niri.output_management_state.notify_changes(new_config);
     }
 
-    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) {
+    pub fn open_screenshot_ui(&mut self, show_pointer: bool, path: Option<String>) -> bool {
         if self.niri.is_locked() || self.niri.screenshot_ui.is_open() {
-            return;
+            return false;
         }
 
         let default_output = self
@@ -2265,7 +2275,7 @@ impl State {
             .output_under_cursor()
             .or_else(|| self.niri.layout.active_output().cloned());
         let Some(default_output) = default_output else {
-            return;
+            return false;
         };
 
         self.niri.update_render_elements(None);
@@ -2274,22 +2284,33 @@ impl State {
             .backend
             .with_primary_renderer(|renderer| self.niri.capture_screenshots(renderer).collect())
         else {
-            return;
+            return false;
         };
 
         // Now that we captured the screenshots, clear grabs.
         self.cancel_pointing_grabs();
 
-        self.backend.with_primary_renderer(|renderer| {
-            self.niri
-                .screenshot_ui
-                .open(renderer, screenshots, default_output, show_pointer, path)
-        });
+        let opened = self
+            .backend
+            .with_primary_renderer(|renderer| {
+                self.niri.screenshot_ui.open(
+                    renderer,
+                    screenshots,
+                    default_output,
+                    show_pointer,
+                    path,
+                )
+            })
+            .unwrap_or(false);
+        if !opened {
+            return false;
+        }
 
         self.niri
             .cursor_manager
             .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
         self.niri.queue_redraw_all();
+        true
     }
 
     /// Cancel pointing device grabs like drag-and-drop, etc.
@@ -2306,6 +2327,93 @@ impl State {
 
         for tool in self.niri.seat.tablet_seat().get_tools().into_values() {
             tool.unset_grab(self, SERIAL_COUNTER.next_serial(), time);
+        }
+    }
+
+    pub(crate) fn handle_ipc_screenshot(
+        &mut self,
+        request: niri_ipc::ScreenshotRequest,
+        tx: async_channel::Sender<IpcScreenshotReply>,
+    ) {
+        if tx.is_closed() {
+            return;
+        }
+
+        let result = (|| -> anyhow::Result<_> {
+            ensure!(!self.niri.is_locked(), "session is locked");
+            ensure!(
+                !self.niri.screenshot_ui.is_open(),
+                "screenshot UI is already open"
+            );
+
+            let niri_ipc::ScreenshotRequest {
+                target,
+                show_pointer,
+            } = request;
+            let captured = match target {
+                niri_ipc::ScreenshotTarget::Selection => {
+                    ensure!(
+                        self.open_screenshot_ui(show_pointer, None),
+                        "could not open screenshot UI"
+                    );
+                    self.niri.cancel_mru();
+                    None
+                }
+                niri_ipc::ScreenshotTarget::Screen => {
+                    let output = self
+                        .niri
+                        .layout
+                        .active_output()
+                        .cloned()
+                        .context("no output is focused")?;
+                    Some(
+                        self.backend
+                            .with_primary_renderer(|renderer| {
+                                self.niri.screenshot_pixels(renderer, &output, show_pointer)
+                            })
+                            .context("no renderer is available")??,
+                    )
+                }
+                niri_ipc::ScreenshotTarget::Window { id } => {
+                    let window = if let Some(id) = id {
+                        self.niri
+                            .layout
+                            .windows()
+                            .find(|(_, mapped)| mapped.id().get() == id)
+                            .and_then(|(monitor, mapped)| {
+                                monitor.map(|monitor| (mapped, monitor.output()))
+                            })
+                    } else {
+                        self.niri.layout.focus_with_output()
+                    };
+                    let (mapped, output) = window.context("window is not available")?;
+                    Some(
+                        self.backend
+                            .with_primary_renderer(|renderer| {
+                                self.niri
+                                    .render_window_pixels(
+                                        renderer,
+                                        output,
+                                        mapped,
+                                        show_pointer,
+                                        true,
+                                    )
+                                    .map(|(size, _, pixels)| (size, pixels))
+                            })
+                            .context("no renderer is available")??,
+                    )
+                }
+            };
+
+            Ok(captured)
+        })();
+
+        match result {
+            Ok(Some((size, pixels))) => self.niri.save_ipc_screenshot(size, pixels, tx),
+            Ok(None) => self.niri.pending_ipc_screenshot = Some(tx),
+            Err(err) => {
+                let _ = tx.send_blocking(Err(format!("{err:#}")));
+            }
         }
     }
 
@@ -2785,6 +2893,7 @@ impl Niri {
         let mods_with_finger_scroll_binds = mods_with_finger_scroll_binds(mod_key, &config_.binds);
         let mods_with_tablet_stylus_binds = mods_with_tablet_stylus_binds(mod_key, &config_.binds);
 
+        let agent_indicator = AgentIndicator::new(animation_clock.clone());
         let screenshot_ui = ScreenshotUi::new(animation_clock.clone(), config.clone());
         let window_mru_ui = WindowMruUi::new(config.clone());
         let config_error_notification =
@@ -2822,6 +2931,7 @@ impl Niri {
                         client,
                         restricted: false,
                         credentials_unknown: false,
+                        agent_launch: None,
                     });
                 })
                 .unwrap();
@@ -2993,6 +3103,7 @@ impl Niri {
             locked_hint: None,
 
             screenshot_ui,
+            pending_ipc_screenshot: None,
             config_error_notification,
             hotkey_overlay,
             exit_confirm_dialog,
@@ -3003,6 +3114,8 @@ impl Niri {
             pending_mru_commit: None,
 
             pick_window: None,
+            agent_input: Default::default(),
+            agent_indicator,
             pick_color: None,
 
             debug_draw_opaque_regions: false,
@@ -3041,6 +3154,7 @@ impl Niri {
             client,
             restricted,
             credentials_unknown,
+            agent_launch,
         } = client;
 
         let config = self.config.borrow();
@@ -3050,6 +3164,7 @@ impl Niri {
             primary_selection_disabled: config.clipboard.disable_primary,
             restricted,
             credentials_unknown,
+            agent_launch,
         });
 
         if let Err(err) = self.display_handle.insert_client(client, data) {
@@ -3697,6 +3812,19 @@ impl Niri {
     ///
     /// This function does not take pointer or touch grabs into account.
     pub fn contents_under(&self, pos: Point<f64, Logical>) -> PointContents {
+        let mut contents = self.contents_under_without_agent_hold(pos);
+        if contents
+            .surface
+            .as_ref()
+            .and_then(|(surface, _)| surface.client())
+            .is_some_and(|client| self.agent_input.holds_pointer(&client.id()))
+        {
+            contents.surface = None;
+        }
+        contents
+    }
+
+    pub fn contents_under_without_agent_hold(&self, pos: Point<f64, Logical>) -> PointContents {
         let mut rv = PointContents::default();
 
         let Some((output, pos_within_output)) = self.output_under(pos) else {
@@ -4525,6 +4653,7 @@ impl Niri {
         let _span = tracy_client::span!("Niri::advance_animations");
 
         self.layout.advance_animations();
+        self.agent_indicator.advance_animations();
         self.config_error_notification.advance_animations();
         self.exit_confirm_dialog.advance_animations();
         self.screenshot_ui.advance_animations();
@@ -4683,6 +4812,11 @@ impl Niri {
         // The pointer goes on the top.
         if include_pointer && self.pointer_visibility.is_visible() {
             self.render_pointer(ctx.renderer, output, &mut |elem| push(elem.into()));
+        }
+
+        if !self.is_locked() {
+            self.agent_indicator
+                .render(ctx.renderer, output, &mut |element| push(element.into()));
         }
 
         // Next, the screen transition texture.
@@ -5064,6 +5198,8 @@ impl Niri {
 
         let mut res = RenderResult::Skipped;
         if self.monitors_active {
+            let agent_indicator_animating =
+                !self.is_locked() && self.agent_indicator.are_animations_ongoing();
             let state = self.output_state.get_mut(output).unwrap();
             state.unfinished_animations_remain = self.layout.are_animations_ongoing(Some(output));
             state.unfinished_animations_remain |=
@@ -5071,6 +5207,7 @@ impl Niri {
             state.unfinished_animations_remain |= self.exit_confirm_dialog.are_animations_ongoing();
             state.unfinished_animations_remain |= self.screenshot_ui.are_animations_ongoing();
             state.unfinished_animations_remain |= self.window_mru_ui.are_animations_ongoing();
+            state.unfinished_animations_remain |= agent_indicator_animating;
             state.unfinished_animations_remain |= state.screen_transition.is_some();
 
             // Also keep redrawing if the current cursor is animated.
@@ -6533,6 +6670,35 @@ impl Niri {
             .context("error saving screenshot")
     }
 
+    fn screenshot_pixels(
+        &mut self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        include_pointer: bool,
+    ) -> anyhow::Result<(Size<i32, Physical>, Vec<u8>)> {
+        let _span = tracy_client::span!("Niri::screenshot");
+        self.update_render_elements(Some(output));
+        let size = output
+            .current_transform()
+            .transform_size(output.current_mode().unwrap().size);
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::ScreenCapture,
+            xray: None,
+        };
+        let elements = self.render_to_vec(ctx, output, include_pointer);
+        let pixels = render_to_vec(
+            renderer,
+            size,
+            scale,
+            Transform::Normal,
+            Fourcc::Abgr8888,
+            elements.iter().rev(),
+        )?;
+        Ok((size, pixels))
+    }
+
     pub fn screenshot_window(
         &self,
         renderer: &mut GlesRenderer,
@@ -6542,11 +6708,26 @@ impl Niri {
         show_pointer: bool,
         path: Option<String>,
     ) -> anyhow::Result<()> {
-        let target = RenderTarget::ScreenCapture;
-        if target.should_hide(mapped.rules().block_out_from) {
-            // We won't have any elements to render. Saving a fully transparent picture is odd.
-            bail!("window is hidden from screen capture");
-        }
+        let (size, _, pixels) =
+            self.render_window_pixels(renderer, output, mapped, show_pointer, true)?;
+        self.save_screenshot(size, pixels, write_to_disk, path)
+            .context("error saving screenshot")
+    }
+
+    /// Renders a window into RGBA8 pixels without any side effects. Also returns the scale and
+    /// the window geometry origin inside the image (physical pixels).
+    pub fn render_window_pixels(
+        &self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        mapped: &Mapped,
+        show_pointer: bool,
+        capture_pixels: bool,
+    ) -> anyhow::Result<WindowPixels> {
+        ensure!(
+            !RenderTarget::ScreenCapture.should_hide(mapped.rules().block_out_from),
+            "window is hidden from screen capture"
+        );
 
         let _span = tracy_client::span!("Niri::screenshot_window");
 
@@ -6576,7 +6757,7 @@ impl Niri {
 
         let ctx = RenderCtx {
             renderer,
-            target,
+            target: RenderTarget::ScreenCapture,
             xray: None,
         };
         mapped.render(
@@ -6594,17 +6775,126 @@ impl Niri {
         let elements = elements.iter().rev().map(|elem| {
             RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
         });
-        let pixels = render_to_vec(
-            renderer,
-            geo.size,
-            scale,
-            Transform::Normal,
-            Fourcc::Abgr8888,
-            elements,
-        )?;
+        let pixels = if capture_pixels {
+            render_to_vec(
+                renderer,
+                geo.size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements,
+            )?
+        } else {
+            Vec::new()
+        };
 
-        self.save_screenshot(geo.size, pixels, write_to_disk, path)
-            .context("error saving screenshot")
+        // mapped.render() above puts the window geometry origin at geometry().loc.
+        let geometry_origin = mapped
+            .window
+            .geometry()
+            .loc
+            .to_physical_precise_round(scale)
+            - geo.loc;
+        Ok((geo.size, (scale.x, geometry_origin), pixels))
+    }
+
+    pub fn render_layer_pixels(
+        &self,
+        renderer: &mut GlesRenderer,
+        output: &Output,
+        mapped: &MappedLayer,
+        capture_pixels: bool,
+    ) -> anyhow::Result<WindowPixels> {
+        let scale = Scale::from(output.current_scale().fractional_scale());
+        let mut elements: Vec<WindowScreenshotRenderElement<GlesRenderer>> = Vec::new();
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::ScreenCapture,
+            xray: None,
+        };
+        mapped.render_popups(
+            ctx,
+            None,
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            &mut |e| elements.push(e.into()),
+        );
+        let ctx = RenderCtx {
+            renderer,
+            target: RenderTarget::ScreenCapture,
+            xray: None,
+        };
+        mapped.render_normal(
+            ctx,
+            None,
+            Point::from((0., 0.)),
+            XrayPos::default(),
+            &mut |e| elements.push(e.into()),
+        );
+        let geo = encompassing_geo(scale, elements.iter());
+        let elements = elements.iter().rev().map(|elem| {
+            RelocateRenderElement::from_element(elem, geo.loc.upscale(-1), Relocate::Relative)
+        });
+        let pixels = if capture_pixels {
+            render_to_vec(
+                renderer,
+                geo.size,
+                scale,
+                Transform::Normal,
+                Fourcc::Abgr8888,
+                elements,
+            )?
+        } else {
+            Vec::new()
+        };
+        let origin = mapped.bob_offset().to_physical_precise_round(scale) - geo.loc;
+        Ok((geo.size, (scale.x, origin), pixels))
+    }
+
+    fn save_ipc_screenshot(
+        &self,
+        size: Size<i32, Physical>,
+        pixels: Vec<u8>,
+        tx: async_channel::Sender<IpcScreenshotReply>,
+    ) {
+        thread::spawn(move || {
+            let mut buf = Vec::new();
+            let result = write_png_rgba8(
+                std::io::Cursor::new(&mut buf),
+                size.w as u32,
+                size.h as u32,
+                &pixels,
+            )
+            .context("error encoding screenshot image")
+            .map(|()| Some(buf))
+            .map_err(|err| format!("{err:#}"));
+
+            let _ = tx.send_blocking(result);
+        });
+    }
+
+    pub(crate) fn close_screenshot_ui(&mut self) {
+        if !self.screenshot_ui.close() {
+            return;
+        }
+
+        if let Some(pending) = self.pending_ipc_screenshot.take() {
+            let _ = pending.send_blocking(Ok(None));
+        }
+
+        self.cursor_manager
+            .set_cursor_image(CursorImageStatus::default_named());
+        self.queue_redraw_all();
+    }
+
+    pub(crate) fn cancel_ipc_screenshot(&mut self, tx: &async_channel::Sender<IpcScreenshotReply>) {
+        if self
+            .pending_ipc_screenshot
+            .as_ref()
+            .is_some_and(|pending| pending.same_channel(tx))
+        {
+            self.close_screenshot_ui();
+        }
     }
 
     pub fn save_screenshot(
@@ -7136,6 +7426,10 @@ impl Niri {
 
     pub fn focus_layer_surface_if_on_demand(&mut self, surface: Option<LayerSurface>) {
         if let Some(surface) = surface {
+            // A real click explicitly hands this layer back to the user.
+            if let Some(mapped) = self.mapped_layer_surfaces.get_mut(&surface) {
+                mapped.agent_focus_suppressed = false;
+            }
             if surface.cached_state().keyboard_interactivity
                 == wlr_layer::KeyboardInteractivity::OnDemand
             {
@@ -7234,11 +7528,6 @@ impl Niri {
             if current_focus.output.as_ref() != Some(output) {
                 self.layout.focus_output(output);
             }
-        }
-
-        // Skip focusing the window/layer when outputs-only=true
-        if let Some(true) = ffm.outputs_only {
-            return;
         }
 
         if let Some(window) = &new_focus.window {
@@ -7509,6 +7798,7 @@ pub struct NewClient {
     pub client: UnixStream,
     pub restricted: bool,
     pub credentials_unknown: bool,
+    pub agent_launch: Option<Arc<crate::agent_input::AgentWorkspaceLaunch>>,
 }
 
 pub struct ClientState {
@@ -7519,6 +7809,7 @@ pub struct ClientState {
     pub restricted: bool,
     /// We cannot retrieve this client's socket credentials.
     pub credentials_unknown: bool,
+    pub agent_launch: Option<Arc<crate::agent_input::AgentWorkspaceLaunch>>,
 }
 
 impl ClientData for ClientState {
@@ -7555,6 +7846,7 @@ niri_render_elements! {
 niri_render_elements! {
     WindowScreenshotRenderElement<R> => {
         Layout = LayoutElementRenderElement<R>,
+        Layer = LayerSurfaceRenderElement<R>,
         Pointer = RelocateRenderElement<PointerRenderElements<R>>,
     }
 }

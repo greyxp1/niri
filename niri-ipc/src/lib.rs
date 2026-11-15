@@ -85,6 +85,8 @@ pub enum Request {
     PickWindow,
     /// Request picking a color from the screen.
     PickColor,
+    /// Capture a screenshot synchronously.
+    Screenshot(ScreenshotRequest),
     /// Perform an action.
     Action(Action),
     /// Change output configuration temporarily.
@@ -119,6 +121,233 @@ pub enum Request {
     OverviewState,
     /// Request information about screencasts.
     Casts,
+    /// Show the agent indicator while this dedicated IPC connection remains open.
+    AgentSession,
+    /// Control a desktop test across temporary IPC connections.
+    AgentDesktopSession {
+        /// Stable thread identity.
+        session: String,
+        /// Session lifecycle operation.
+        action: AgentDesktopAction,
+    },
+    /// Reserve an agent workspace while this dedicated connection remains open.
+    AgentWorkspace {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Read the agent workspace's human-control state.
+    AgentWorkspaceStatus {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Check whether a workspace needs explicit cleanup before an agent stops.
+    AgentCleanupCheck {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Finish computer use and close its unclaimed windows without terminating shared apps.
+    AgentFinish {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Preserve a window after computer use finishes.
+    AgentKeepWindow {
+        /// Workspace name.
+        workspace: String,
+        /// Window ID.
+        window_id: u64,
+    },
+    /// Pause workspace automation for human assistance.
+    AgentHandoff {
+        /// Workspace name.
+        workspace: String,
+        /// What the user needs to do.
+        reason: String,
+    },
+    /// Resume workspace automation after the user returns control.
+    AgentResume {
+        /// Workspace name.
+        workspace: String,
+    },
+    /// Launch an application with an urgency-only activation token.
+    ///
+    /// Workspace launches wait for a new window. Other launches are queued asynchronously.
+    AgentSpawn {
+        /// Executable and its arguments.
+        command: Vec<String>,
+        /// Target agent workspace, when reserved.
+        workspace: Option<String>,
+    },
+    /// Deliver input to one window or layer surface without changing the seat focus.
+    ///
+    /// Events are sent directly to the client's own `wl_pointer`/`wl_keyboard` objects. The
+    /// compositor's pointer location, cursor image, keyboard focus and window activation are left
+    /// untouched. Input can mix with human input in the same window. Keyboard input is rejected
+    /// when a different window of the same client holds real focus.
+    AgentInput {
+        /// Stable window or layer-surface ID.
+        window_id: u64,
+        /// Restrict the request to this agent workspace.
+        workspace: Option<String>,
+        /// Geometry of the observation used for pointer coordinates.
+        #[serde(default)]
+        geometry: Option<AgentScreenshotInfo>,
+        /// Events to deliver, in order.
+        events: Vec<AgentEvent>,
+    },
+    /// Screenshot one window or layer surface to a PNG file with no side effects.
+    ///
+    /// Unlike the `ScreenshotWindow` action, this neither shows a notification nor replaces the
+    /// clipboard selection. Replies after the file has been written.
+    AgentScreenshot {
+        /// Stable window or layer-surface ID.
+        window_id: u64,
+        /// Restrict the request to this agent workspace.
+        workspace: Option<String>,
+        /// Absolute output path.
+        path: String,
+        /// Whether to include the pointer if it is over the window.
+        show_pointer: bool,
+    },
+}
+
+/// Desktop test lifecycle operations.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentDesktopAction {
+    /// Begin or inspect a desktop test.
+    Status,
+    /// Return desktop control to the user.
+    Handoff {
+        /// What the user needs to do.
+        reason: String,
+    },
+    /// Continue after the user returns control.
+    Resume,
+    /// Finish without closing personal windows.
+    Finish,
+}
+
+/// A desktop test that remains open between tool connections.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentDesktopSession {
+    /// Stable thread identity.
+    pub name: String,
+    /// Automation is paused for human control.
+    pub paused: bool,
+    /// Requested human intervention.
+    pub reason: Option<String>,
+    /// Another connected session requested the pending human handoff.
+    pub handoff_for_other_session: bool,
+}
+
+/// A workspace reserved by an agent connection.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentWorkspace {
+    /// Workspace name.
+    pub name: String,
+    /// Stable workspace ID.
+    pub id: u64,
+    /// Automation is paused for human control.
+    pub paused: bool,
+    /// Requested human intervention.
+    pub reason: Option<String>,
+    /// Another connected session requested the pending human handoff.
+    pub handoff_for_other_session: bool,
+}
+
+/// How [`AgentEvent::Text`] enters characters missing from the seat keymap.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentUnicodeInput {
+    /// Send a temporary keymap with those characters to the target client only, then restore the
+    /// seat keymap.
+    #[default]
+    Keymap,
+    /// Ctrl+Shift+U, the hexadecimal code point, Space (GTK/Chromium Unicode entry).
+    CtrlShiftU,
+}
+
+/// Geometry of an [`Request::AgentScreenshot`] image.
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct AgentScreenshotInfo {
+    /// Image width in physical pixels.
+    pub width: u32,
+    /// Image height in physical pixels.
+    pub height: u32,
+    /// Output scale: physical pixels per logical pixel.
+    pub scale: f64,
+    /// Window geometry origin inside the image, in physical pixels. `AgentEvent::Motion`
+    /// coordinates are `(image_px - geometry_px) / scale`.
+    pub geometry_x: i32,
+    /// See `geometry_x`.
+    pub geometry_y: i32,
+}
+
+/// Event for [`Request::AgentInput`].
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentEvent {
+    /// Move the agent pointer to window-geometry-relative logical coordinates.
+    Motion {
+        /// X coordinate.
+        x: f64,
+        /// Y coordinate.
+        y: f64,
+    },
+    /// Press or release a pointer button (evdev code, e.g. 272 for left).
+    Button {
+        /// Button code.
+        button: u32,
+        /// Pressed or released.
+        pressed: bool,
+    },
+    /// Scroll by the given logical amounts.
+    Axis {
+        /// Vertical scroll amount.
+        vertical: f64,
+        /// Horizontal scroll amount.
+        horizontal: f64,
+    },
+    /// Press or release a key (evdev keycode, e.g. 30 for A).
+    Key {
+        /// Evdev keycode.
+        keycode: u32,
+        /// Pressed or released.
+        pressed: bool,
+    },
+    /// Type text. Characters present in the seat keymap are typed with their keys (and Shift);
+    /// the others with `unicode_input`.
+    Text {
+        /// Text to type.
+        text: String,
+        /// How to enter characters that the seat keymap lacks.
+        #[serde(default)]
+        unicode_input: AgentUnicodeInput,
+    },
+    /// Send pointer leave to the surface the agent pointer is on.
+    PointerLeave,
+    /// Send keyboard leave to the surface the agent keyboard is on.
+    KeyboardLeave,
+}
+
+/// What a computer-use agent did, for [`Event::AgentInputActivity`].
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum AgentActivityKind {
+    /// Moved the agent pointer (or sent pointer leave).
+    Pointer,
+    /// Pressed or released a pointer button.
+    Click,
+    /// Scrolled.
+    Scroll,
+    /// Pressed keys or typed text.
+    Keyboard,
+    /// Took a screenshot of the window.
+    Screenshot,
 }
 
 /// Reply from niri to client.
@@ -137,6 +366,18 @@ pub type Reply = Result<Response, String>;
 pub enum Response {
     /// A request that does not need a response was handled successfully.
     Handled,
+    /// Desktop test state, or None after completion.
+    AgentDesktopSession(Option<AgentDesktopSession>),
+    /// New window IDs from a workspace application launch.
+    AgentSpawn(Vec<u64>),
+    /// Result of [`Request::AgentScreenshot`].
+    AgentScreenshot(AgentScreenshotInfo),
+    /// Workspace reservation or control state.
+    AgentWorkspace(AgentWorkspace),
+    /// Whether explicit workspace cleanup is needed.
+    AgentCleanupNeeded(bool),
+    /// Whether an agent workspace finished rather than preserving a handoff.
+    AgentFinished(bool),
     /// The version string for the running niri instance.
     Version(String),
     /// Information about connected outputs.
@@ -159,6 +400,8 @@ pub enum Response {
     PickedWindow(Option<Window>),
     /// Information about the picked color.
     PickedColor(Option<PickedColor>),
+    /// Captured screenshot, or `None` if cancelled.
+    Screenshot(Option<Screenshot>),
     /// Output configuration change result.
     OutputConfigChanged(OutputConfigChanged),
     /// Information about the overview.
@@ -181,6 +424,39 @@ pub struct Overview {
 pub struct PickedColor {
     /// Color values as red, green, blue, each ranging from 0.0 to 1.0.
     pub rgb: [f64; 3],
+}
+
+/// Screenshot request.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct ScreenshotRequest {
+    /// Target to capture.
+    pub target: ScreenshotTarget,
+    /// Whether to include the mouse pointer.
+    pub show_pointer: bool,
+}
+
+/// Screenshot target.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub enum ScreenshotTarget {
+    /// Interactive region selection.
+    Selection,
+    /// Capture the focused screen.
+    Screen,
+    /// Window capture.
+    Window {
+        /// Window id, or the focused window if omitted.
+        id: Option<u64>,
+    },
+}
+
+/// Successful screenshot result.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
+pub struct Screenshot {
+    /// Length of the returned PNG data.
+    pub data_length: u64,
 }
 
 /// Actions that niri can perform.
@@ -1609,6 +1885,12 @@ pub enum LayerSurfaceKeyboardInteractivity {
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
 pub struct LayerSurface {
+    /// Stable ID shared with the window ID namespace. Changes after unmapping.
+    pub id: u64,
+    /// Process owning the surface, if its credentials are available.
+    pub pid: Option<i32>,
+    /// Surface geometry in output-local logical coordinates.
+    pub geometry: (i32, i32, i32, i32),
     /// Namespace provided by the layer-shell client.
     pub namespace: String,
     /// Name of the output the surface is on.
@@ -1856,6 +2138,17 @@ pub enum Event {
         /// Note that this only indicates the [`Action::ToggleTouchpad`] state. The touchpad can be
         /// disabled in hardware, or via `input { touchpad { off; } }`—this is not reflected here.
         on: bool,
+    },
+    /// A computer-use agent sent input to a window or took its screenshot.
+    ///
+    /// Sent once per [`Request::AgentInput`] or [`Request::AgentScreenshot`]. For a request
+    /// with several kinds of events, `kind` is the most significant one (keyboard, then click,
+    /// then scroll, then pointer).
+    AgentInputActivity {
+        /// Id of the window.
+        window_id: u64,
+        /// What the agent did.
+        kind: AgentActivityKind,
     },
 }
 

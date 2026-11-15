@@ -42,6 +42,18 @@ mod platform {
 mod platform {
     use std::{io, mem};
 
+    pub fn termination_fd() -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let mask = preferred_sigset()?;
+        set_sigmask(&mask)?;
+        let fd = unsafe { libc::signalfd(-1, &mask, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: signalfd returned a new, owned descriptor.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    }
+
     pub fn listen(handle: &calloop::LoopHandle<crate::niri::State>) {
         use calloop::signals::{Signal, Signals};
 

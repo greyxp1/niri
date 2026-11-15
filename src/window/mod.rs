@@ -183,6 +183,13 @@ impl<'a> WindowRef<'a> {
             WindowRef::Mapped(mapped) => mapped.is_window_cast_target(),
         }
     }
+
+    pub fn is_agent_driven(self) -> bool {
+        match self {
+            WindowRef::Unmapped(_) => false,
+            WindowRef::Mapped(mapped) => mapped.is_agent_driven(),
+        }
+    }
 }
 
 impl ResolvedWindowRules {
@@ -454,6 +461,12 @@ fn window_matches(window: WindowRef, role: &XdgToplevelSurfaceRoleAttributes, m:
 
     if let Some(is_window_cast_target) = m.is_window_cast_target {
         if window.is_window_cast_target() != is_window_cast_target {
+            return false;
+        }
+    }
+
+    if let Some(is_agent_driven) = m.is_agent_driven {
+        if window.is_agent_driven() != is_agent_driven {
             return false;
         }
     }

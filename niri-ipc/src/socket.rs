@@ -1,12 +1,12 @@
 //! Helper for blocking communication over the niri socket.
 
 use std::env;
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::Path;
 
-use crate::{Event, Reply, Request};
+use crate::{Event, Reply, Request, Response, ScreenshotRequest};
 
 /// Name of the environment variable containing the niri IPC socket path.
 pub const SOCKET_PATH_ENV: &str = "NIRI_SOCKET";
@@ -20,6 +20,17 @@ pub struct Socket {
 }
 
 impl Socket {
+    /// Clone the connection handle for cancelling a blocked request with `shutdown`.
+    pub fn shutdown_handle(&self) -> io::Result<UnixStream> {
+        self.stream.get_ref().try_clone()
+    }
+
+    /// Limit how long a blocking read or write may wait on the compositor.
+    pub fn set_timeout(&self, timeout: Option<std::time::Duration>) -> io::Result<()> {
+        self.stream.get_ref().set_read_timeout(timeout)?;
+        self.stream.get_ref().set_write_timeout(timeout)
+    }
+
     /// Connects to the default niri IPC socket.
     ///
     /// This is equivalent to calling [`Self::connect_to`] with the path taken from the
@@ -57,6 +68,30 @@ impl Socket {
         self.stream.read_line(&mut buf)?;
 
         let reply = serde_json::from_str(&buf)?;
+        Ok(reply)
+    }
+
+    /// Sends a screenshot request and writes returned PNG data to `output`.
+    pub fn send_screenshot(
+        &mut self,
+        request: ScreenshotRequest,
+        mut output: impl Write,
+    ) -> io::Result<Reply> {
+        let reply = self.send(Request::Screenshot(request))?;
+
+        if let Ok(Response::Screenshot(Some(screenshot))) = &reply {
+            let copied = io::copy(
+                &mut self.stream.by_ref().take(screenshot.data_length),
+                &mut output,
+            )?;
+            if copied != screenshot.data_length {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "screenshot data ended early",
+                ));
+            }
+        }
+
         Ok(reply)
     }
 
