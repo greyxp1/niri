@@ -75,7 +75,6 @@ impl MergeWith<LayoutPart> for Layout {
             always_center_single_column,
             fill_empty_space,
             maximize_single_window_to_edges,
-            maximize_single_window_to_edges,
             empty_workspace_above_first,
             gaps,
         );
@@ -129,6 +128,7 @@ pub struct LayoutPart {
     pub always_center_single_column: Option<Flag>,
     #[knuffel(child)]
     pub fill_empty_space: Option<Flag>,
+    #[knuffel(child)]
     pub maximize_single_window_to_edges: Option<Flag>,
     #[knuffel(child)]
     pub empty_workspace_above_first: Option<Flag>,
