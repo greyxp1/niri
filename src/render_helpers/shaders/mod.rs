@@ -1,4 +1,6 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
+pub mod shared_corner_portable;
 
 use glam::Mat3;
 use smithay::backend::renderer::gles::{
@@ -12,6 +14,9 @@ use crate::render_helpers::blur::BlurProgram;
 
 pub struct Shaders {
     pub border: Option<ShaderProgram>,
+    pub shared_programs: RefCell<HashMap<shared_corner_portable::ShaderKey, Option<ShaderProgram>>>,
+    pub shared_resize_source: RefCell<Option<String>>,
+    pub shared_corner: Option<ShaderProgram>,
     pub shadow: Option<ShaderProgram>,
     pub clipped_surface: Option<GlesTexProgram>,
     pub postprocess_and_clip: Option<GlesTexProgram>,
@@ -26,6 +31,7 @@ pub struct Shaders {
 #[derive(Debug, Clone, Copy)]
 pub enum ProgramType {
     Border,
+    SharedCorner,
     Shadow,
     Resize,
     Close,
@@ -36,32 +42,11 @@ impl Shaders {
     fn compile(renderer: &mut GlesRenderer) -> Self {
         let _span = tracy_client::span!("Shaders::compile");
 
-        let border = ShaderProgram::compile(
-            renderer,
-            concat!(
-                include_str!("border.frag"),
-                include_str!("rounding_alpha.frag")
-            ),
-            &[
-                UniformName::new("colorspace", UniformType::_1f),
-                UniformName::new("hue_interpolation", UniformType::_1f),
-                UniformName::new("color_from", UniformType::_4f),
-                UniformName::new("color_to", UniformType::_4f),
-                UniformName::new("grad_offset", UniformType::_2f),
-                UniformName::new("grad_width", UniformType::_1f),
-                UniformName::new("grad_vec", UniformType::_2f),
-                UniformName::new("input_to_geo", UniformType::Matrix3x3),
-                UniformName::new("geo_size", UniformType::_2f),
-                UniformName::new("outer_radius", UniformType::_4f),
-                UniformName::new("border_width", UniformType::_1f),
-            ],
-            &[],
-        )
-        .map_err(|err| {
-            warn!("error compiling border shader: {err:?}");
-        })
-        .ok();
+        let border = compile_border(renderer)
+            .map_err(|err| warn!("error compiling border shader: {err:?}"))
+            .ok();
 
+        let shared_corner = super::shared_corner::compile(renderer);
         let shadow = ShaderProgram::compile(
             renderer,
             concat!(
@@ -109,6 +94,7 @@ impl Shaders {
                 concat!(
                     include_str!("clipped_surface.frag"),
                     include_str!("rounding_alpha.frag"),
+                    include_str!("postprocess_common.frag"),
                     include_str!("postprocess.frag"),
                 ),
                 &[
@@ -150,6 +136,19 @@ impl Shaders {
 
         Self {
             border,
+            shared_programs: RefCell::new(
+                shared_corner
+                    .as_ref()
+                    .map(|program| {
+                        HashMap::from([(
+                            super::shared_corner::default_key(),
+                            Some(program.clone()),
+                        )])
+                    })
+                    .unwrap_or_default(),
+            ),
+            shared_resize_source: RefCell::new(None),
+            shared_corner,
             shadow,
             clipped_surface,
             postprocess_and_clip,
@@ -199,6 +198,7 @@ impl Shaders {
     pub fn program(&self, program: ProgramType) -> Option<ShaderProgram> {
         match program {
             ProgramType::Border => self.border.clone(),
+            ProgramType::SharedCorner => self.shared_corner.clone(),
             ProgramType::Shadow => self.shadow.clone(),
             ProgramType::Resize => self
                 .custom_resize
@@ -219,6 +219,21 @@ pub fn init(renderer: &mut GlesRenderer) {
     }
 }
 
+pub(crate) fn resize_uniforms() -> [UniformName<'static>; 10] {
+    [
+        UniformName::new("niri_input_to_curr_geo", UniformType::Matrix3x3),
+        UniformName::new("niri_curr_geo_to_prev_geo", UniformType::Matrix3x3),
+        UniformName::new("niri_curr_geo_to_next_geo", UniformType::Matrix3x3),
+        UniformName::new("niri_curr_geo_size", UniformType::_2f),
+        UniformName::new("niri_geo_to_tex_prev", UniformType::Matrix3x3),
+        UniformName::new("niri_geo_to_tex_next", UniformType::Matrix3x3),
+        UniformName::new("niri_progress", UniformType::_1f),
+        UniformName::new("niri_clamped_progress", UniformType::_1f),
+        UniformName::new("niri_corner_radius", UniformType::_4f),
+        UniformName::new("niri_clip_to_geometry", UniformType::_1f),
+    ]
+}
+
 fn compile_resize_program(
     renderer: &mut GlesRenderer,
     src: &str,
@@ -231,18 +246,7 @@ fn compile_resize_program(
     ShaderProgram::compile(
         renderer,
         &program,
-        &[
-            UniformName::new("niri_input_to_curr_geo", UniformType::Matrix3x3),
-            UniformName::new("niri_curr_geo_to_prev_geo", UniformType::Matrix3x3),
-            UniformName::new("niri_curr_geo_to_next_geo", UniformType::Matrix3x3),
-            UniformName::new("niri_curr_geo_size", UniformType::_2f),
-            UniformName::new("niri_geo_to_tex_prev", UniformType::Matrix3x3),
-            UniformName::new("niri_geo_to_tex_next", UniformType::Matrix3x3),
-            UniformName::new("niri_progress", UniformType::_1f),
-            UniformName::new("niri_clamped_progress", UniformType::_1f),
-            UniformName::new("niri_corner_radius", UniformType::_4f),
-            UniformName::new("niri_clip_to_geometry", UniformType::_1f),
-        ],
+        &resize_uniforms(),
         &["niri_tex_prev", "niri_tex_next"],
     )
 }
@@ -260,6 +264,24 @@ pub fn set_custom_resize_program(renderer: &mut GlesRenderer, src: Option<&str>)
         None
     };
 
+    *Shaders::get(renderer).shared_resize_source.borrow_mut() = src.map(str::to_owned);
+    let mut previous = Vec::new();
+    Shaders::get(renderer)
+        .shared_programs
+        .borrow_mut()
+        .retain(|key, program| {
+            if key.uses_resize() {
+                previous.extend(program.take());
+                false
+            } else {
+                true
+            }
+        });
+    for program in previous {
+        if let Err(err) = program.destroy(renderer) {
+            warn!("error destroying shared coverage shader: {err:?}");
+        }
+    }
     if let Some(prev) = Shaders::get(renderer).replace_custom_resize_program(program) {
         if let Err(err) = prev.destroy(renderer) {
             warn!("error destroying previous custom resize shader: {err:?}");
@@ -361,4 +383,28 @@ pub fn mat3_uniform(name: &str, mat: Mat3) -> Uniform<'_> {
             transpose: false,
         },
     )
+}
+
+fn compile_border(
+    renderer: &mut GlesRenderer,
+) -> Result<ShaderProgram, smithay::backend::renderer::gles::GlesError> {
+    let uniforms = [
+        UniformName::new("colorspace", UniformType::_1f),
+        UniformName::new("hue_interpolation", UniformType::_1f),
+        UniformName::new("color_from", UniformType::_4f),
+        UniformName::new("color_to", UniformType::_4f),
+        UniformName::new("grad_offset", UniformType::_2f),
+        UniformName::new("grad_width", UniformType::_1f),
+        UniformName::new("grad_vec", UniformType::_2f),
+        UniformName::new("input_to_geo", UniformType::Matrix3x3),
+        UniformName::new("geo_size", UniformType::_2f),
+        UniformName::new("outer_radius", UniformType::_4f),
+        UniformName::new("border_width", UniformType::_1f),
+    ];
+    let source = concat!(
+        include_str!("border.frag"),
+        include_str!("border_color.frag"),
+        include_str!("rounding_alpha.frag")
+    );
+    ShaderProgram::compile(renderer, source, &uniforms, &[])
 }

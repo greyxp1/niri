@@ -81,6 +81,18 @@ niri_render_elements! {
     }
 }
 
+impl BackgroundEffectElement {
+    pub fn with_shared(self, shared: std::rc::Rc<super::shared_corner::SharedCorner>) -> Self {
+        match self {
+            Self::FramebufferEffect(element) => {
+                Self::FramebufferEffect(element.with_shared(shared))
+            }
+            Self::Xray(element) => Self::Xray(element.with_shared(shared)),
+            Self::ExtraDamage(element) => Self::ExtraDamage(element),
+        }
+    }
+}
+
 impl BackgroundEffect {
     pub fn new() -> Self {
         Self {

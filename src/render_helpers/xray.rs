@@ -81,6 +81,7 @@ pub struct XrayElement {
     saturation: f32,
     bg_color: Color32F,
     program: Option<GlesTexProgram>,
+    shared: Option<Rc<super::shared_corner::SharedCorner>>,
 }
 
 impl Xray {
@@ -188,6 +189,7 @@ impl Xray {
                 geometry.loc += params.geometry.loc;
 
                 let elem = XrayElement {
+                    shared: None,
                     buffer: self.background[ctx.target as usize].clone(),
                     id: background.id().clone(),
                     geometry,
@@ -238,6 +240,7 @@ impl Xray {
                 * Mat3::from_translation(-clip_pos_in_backdrop / buf_size);
 
             let elem = XrayElement {
+                shared: None,
                 buffer: self.backdrop[ctx.target as usize].clone(),
                 id: backdrop.id().clone(),
                 geometry: params.geometry,
@@ -259,6 +262,11 @@ impl Xray {
 }
 
 impl XrayElement {
+    pub fn with_shared(mut self, shared: Rc<super::shared_corner::SharedCorner>) -> Self {
+        self.corner_radius = shared.radius;
+        self.shared = Some(shared);
+        self
+    }
     fn compute_uniforms(&self) -> [Uniform<'static>; 7] {
         [
             Uniform::new("niri_scale", self.scale),
@@ -339,7 +347,38 @@ impl RenderElement<GlesRenderer> for XrayElement {
             damage
         };
 
-        let uniforms = self.program.is_some().then(|| self.compute_uniforms());
+        let shared_damage;
+        let damage = if let Some(shared) = &self.shared {
+            shared.add_effect(
+                frame,
+                texture.clone(),
+                self.geometry,
+                self.src,
+                Transform::Normal,
+                self.noise,
+                self.saturation,
+                self.bg_color.components(),
+                Scale::from(f64::from(self.scale)),
+                self.subregion.as_ref(),
+            )?;
+            let normalized = Rectangle::new(
+                (
+                    (src.loc.x - self.src.loc.x) / self.src.size.w,
+                    (src.loc.y - self.src.loc.y) / self.src.size.h,
+                )
+                    .into(),
+                (src.size.w / self.src.size.w, src.size.h / self.src.size.h).into(),
+            );
+            shared_damage = shared.background_damage(self.geometry, normalized, dst, damage);
+            shared_damage.as_slice()
+        } else {
+            damage
+        };
+        if damage.is_empty() {
+            return Ok(());
+        }
+        let program = self.program.clone();
+        let uniforms = program.is_some().then(|| self.compute_uniforms());
         let uniforms = uniforms.as_ref().map_or(&[][..], |x| &x[..]);
 
         frame.render_texture_from_to(
@@ -351,9 +390,10 @@ impl RenderElement<GlesRenderer> for XrayElement {
             &[],
             Transform::Normal,
             1.,
-            self.program.as_ref(),
+            program.as_ref(),
             uniforms,
-        )
+        )?;
+        Ok(())
     }
 }
 

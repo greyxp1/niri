@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::rc::Rc;
 use std::sync::Once;
 
 use glam::{Mat3, Vec2};
@@ -39,6 +40,7 @@ pub struct FramebufferEffectElement {
     blur_options: Option<BlurOptions>,
     noise: f32,
     saturation: f32,
+    shared: Option<Rc<super::shared_corner::SharedCorner>>,
 }
 
 #[derive(Debug)]
@@ -81,6 +83,7 @@ impl FramebufferEffect {
 
         FramebufferEffectElement {
             id,
+            shared: None,
             commit: self.commit,
             geometry: params.geometry,
             clip_geo,
@@ -95,6 +98,12 @@ impl FramebufferEffect {
 }
 
 impl FramebufferEffectElement {
+    pub fn with_shared(mut self, shared: Rc<super::shared_corner::SharedCorner>) -> Self {
+        self.corner_radius = shared.radius;
+        self.clip_geo = shared.window;
+        self.shared = Some(shared);
+        self
+    }
     fn compute_uniforms(
         &self,
         crop: Rectangle<f64, Logical>,
@@ -398,6 +407,34 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             clamped_dst.size.to_f64().upscale(dst_to_src).to_logical(1.),
         );
 
+        let shared_damage;
+        let damage = if let Some(shared) = &self.shared {
+            let geometry = Rectangle::new(self.geometry.loc + crop.loc, crop.size);
+            shared.add_effect(
+                frame,
+                texture.clone(),
+                geometry,
+                Rectangle::from_size(texture.size().to_f64()),
+                frame.transformation().invert(),
+                self.noise,
+                self.saturation,
+                [0.; 4],
+                Scale::from(f64::from(self.scale)),
+                self.subregion.as_ref(),
+            )?;
+            shared_damage = shared.background_damage(
+                geometry,
+                Rectangle::from_size((1., 1.).into()),
+                clamped_dst,
+                damage,
+            );
+            shared_damage.as_slice()
+        } else {
+            damage
+        };
+        if damage.is_empty() {
+            return Ok(());
+        }
         let program = Shaders::get_from_frame(frame).postprocess_and_clip.clone();
         let uniforms = program
             .is_some()
@@ -415,7 +452,8 @@ impl RenderElement<GlesRenderer> for FramebufferEffectElement {
             1.,
             program.as_ref(),
             uniforms,
-        )
+        )?;
+        Ok(())
     }
 }
 

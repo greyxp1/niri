@@ -4,8 +4,10 @@ use std::rc::Rc;
 use niri_config::utils::MergeWith as _;
 use niri_config::{Color, CornerRadius, GradientInterpolation};
 use niri_ipc::WindowLayout;
+use smithay::backend::renderer::element::surface::WaylandSurfaceTexture;
 use smithay::backend::renderer::element::{Element, Kind};
 use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::Renderer;
 use smithay::utils::{Logical, Point, Rectangle, Scale, Size};
 
 use super::focus_ring::{FocusRing, FocusRingRenderElement};
@@ -23,9 +25,10 @@ use crate::render_helpers::border::BorderRenderElement;
 use crate::render_helpers::clipped_surface::{ClippedSurfaceRenderElement, RoundedCornerDamage};
 use crate::render_helpers::damage::ExtraDamage;
 use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenRenderElement};
-use crate::render_helpers::renderer::NiriRenderer;
+use crate::render_helpers::renderer::{AsGlesTexture as _, NiriRenderer};
 use crate::render_helpers::resize::ResizeRenderElement;
 use crate::render_helpers::shadow::ShadowRenderElement;
+use crate::render_helpers::shared_corner::{CornerCache, SharedCorner, SharedCornerRenderElement};
 use crate::render_helpers::snapshot::RenderSnapshot;
 use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
 use crate::render_helpers::xray::{Xray, XrayPos};
@@ -104,6 +107,7 @@ pub struct Tile<W: LayoutElement> {
 
     /// Extra damage for clipped surface corner radius changes.
     rounded_corner_damage: RoundedCornerDamage,
+    corner_cache: Rc<CornerCache>,
 
     /// The view size for the tile's workspace.
     ///
@@ -133,6 +137,7 @@ niri_render_elements! {
         Offscreen = OffscreenRenderElement,
         ExtraDamage = ExtraDamage,
         BackgroundEffect = BackgroundEffectElement,
+        SharedCorner = SharedCornerRenderElement,
     }
 }
 
@@ -213,6 +218,7 @@ impl<W: LayoutElement> Tile<W> {
             interactive_move_offset: Point::from((0., 0.)),
             unmap_snapshot: None,
             rounded_corner_damage: Default::default(),
+            corner_cache: Default::default(),
             view_size,
             scale,
             clock,
@@ -1136,7 +1142,8 @@ impl<W: LayoutElement> Tile<W> {
         );
 
         // If we're resizing, try to render a shader, or a fallback.
-        let mut pushed_resize = false;
+        let mut prepared_resize = None;
+        let mut resize_fallback = None;
         if let Some(resize) = &self.resize_animation {
             if ResizeRenderElement::has_shader(ctx.renderer) {
                 let mut ctx = ctx.as_gles();
@@ -1195,13 +1202,12 @@ impl<W: LayoutElement> Tile<W> {
                         // This is not a problem for split popups as the code will look for them by
                         // original id when it doesn't find them on the offscreen.
                         self.window.set_offscreen_data(Some(data));
-                        push(elem.into());
-                        pushed_resize = true;
+                        prepared_resize = Some(elem);
                     }
                 }
             }
 
-            if !pushed_resize {
+            if prepared_resize.is_none() {
                 let fallback_buffer = SolidColorBuffer::new(area.size, [1., 0., 0., 1.]);
                 let elem = SolidColorRenderElement::from_buffer(
                     &fallback_buffer,
@@ -1209,14 +1215,113 @@ impl<W: LayoutElement> Tile<W> {
                     win_alpha,
                     Kind::Unspecified,
                 );
-                push(elem.into());
-                pushed_resize = true;
+                resize_fallback = Some(elem);
             }
+        }
+
+        let can_share = clip_to_geometry
+            && radius != CornerRadius::default()
+            && ((self.visual_border_width().is_some() && self.border.draws_outline())
+                || (focus_ring && expanded_progress < 1. && self.focus_ring.draws_outline()))
+            && (self.resize_animation.is_none()
+                || (prepared_resize
+                    .as_ref()
+                    .is_some_and(|elem| elem.supports_shared())))
+            && !ctx.target.should_block_out(rules.block_out_from)
+            && crate::render_helpers::shaders::Shaders::get(ctx.renderer)
+                .shared_corner
+                .is_some();
+        let mut normal_elements = None;
+        let shared_sources_supported = if can_share && self.resize_animation.is_some() {
+            true
+        } else if can_share {
+            let mut elements = Vec::new();
+            self.window.render_normal(
+                ctx.r(),
+                window_render_loc,
+                scale,
+                win_alpha,
+                &mut |element| elements.push(element),
+            );
+            let context = ctx.renderer.as_gles_renderer().context_id();
+            let supported = elements.iter().all(|element| match element {
+                LayoutElementRenderElement::Wayland(element) => match element.texture() {
+                    WaylandSurfaceTexture::Texture(texture) => {
+                        texture.as_gles_texture(&context).is_some()
+                    }
+                    WaylandSurfaceTexture::SolidColor(_) => true,
+                },
+                _ => false,
+            });
+            normal_elements = Some(elements);
+            supported
+        } else {
+            false
+        };
+        let shared = if shared_sources_supported {
+            let origin = window_render_loc;
+            let mut decorations = Vec::new();
+            if let Some(width) = self.visual_border_width() {
+                if let Some(decoration) = self
+                    .border
+                    .decoration(location + Point::from((width, width)), origin)
+                {
+                    decorations.push(decoration);
+                }
+            }
+            if focus_ring && expanded_progress < 1. {
+                if let Some(decoration) = self.focus_ring.decoration(location, origin) {
+                    decorations.push(decoration);
+                }
+            }
+            decorations.last().copied().map(|outer| {
+                let offset = Point::from((f64::from(outer.rect[0]), f64::from(outer.rect[1])));
+                let geometry = Rectangle::new(
+                    origin + offset,
+                    Size::from((f64::from(outer.rect[2]), f64::from(outer.rect[3]))),
+                );
+                let outer_radius = CornerRadius {
+                    top_left: outer.radius[0],
+                    top_right: outer.radius[1],
+                    bottom_right: outer.radius[2],
+                    bottom_left: outer.radius[3],
+                };
+                let corners =
+                    ClippedSurfaceRenderElement::<R>::rounded_corners(geometry, outer_radius);
+                for decoration in &mut decorations {
+                    decoration.rect[0] -= offset.x as f32;
+                    decoration.rect[1] -= offset.y as f32;
+                }
+                let shared = SharedCorner::new(
+                    geometry,
+                    area,
+                    radius,
+                    corners,
+                    decorations.clone(),
+                    self.corner_cache.clone(),
+                    self.scale,
+                );
+                push(shared.element(self.scale).into());
+                shared
+            })
+        } else {
+            None
+        };
+
+        if let Some(elem) = prepared_resize {
+            let elem = if let Some(shared) = &shared {
+                elem.with_shared(shared.clone())
+            } else {
+                elem
+            };
+            push(elem.into());
+        } else if let Some(elem) = resize_fallback {
+            push(elem.into());
         }
 
         // If we're not resizing, render the window itself.
         let has_border_shader = BorderRenderElement::has_shader(ctx.renderer);
-        if !pushed_resize {
+        if self.resize_animation.is_none() {
             let geo = Rectangle::new(window_render_loc, window_size);
             let radius = radius.fit_to(window_size.w as f32, window_size.h as f32);
 
@@ -1226,15 +1331,20 @@ impl<W: LayoutElement> Tile<W> {
                     // If we should clip to geometry, render a clipped window.
                     if clip_to_geometry {
                         if let Some(shader) = clip_shader.clone() {
-                            if ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius) {
-                                return ClippedSurfaceRenderElement::new(
+                            if shared.is_some()
+                                || ClippedSurfaceRenderElement::will_clip(&elem, scale, geo, radius)
+                            {
+                                let mut clipped = ClippedSurfaceRenderElement::new(
                                     elem,
                                     scale,
                                     geo,
                                     shader.clone(),
                                     radius,
-                                )
-                                .into();
+                                );
+                                if let Some(shared) = &shared {
+                                    clipped = clipped.with_shared(shared.clone());
+                                }
+                                return clipped.into();
                             }
                         }
                     }
@@ -1283,10 +1393,19 @@ impl<W: LayoutElement> Tile<W> {
                 push(damage.into());
             }
 
-            self.window
-                .render_normal(ctx.r(), window_render_loc, scale, win_alpha, &mut |elem| {
-                    push(clip(elem))
-                });
+            if let Some(normal_elements) = normal_elements {
+                for element in normal_elements {
+                    push(clip(element));
+                }
+            } else {
+                self.window.render_normal(
+                    ctx.r(),
+                    window_render_loc,
+                    scale,
+                    win_alpha,
+                    &mut |element| push(clip(element)),
+                );
+            }
         }
 
         if fullscreen_progress > 0. {
@@ -1331,11 +1450,14 @@ impl<W: LayoutElement> Tile<W> {
         }
 
         if let Some(width) = self.visual_border_width() {
-            self.border.render(
-                ctx.renderer,
-                location + Point::from((width, width)),
-                &mut |elem| push(elem.into()),
-            );
+            let loc = location + Point::from((width, width));
+            if let Some(shared) = &shared {
+                self.border
+                    .render_shared(loc, shared, &mut |elem| push(elem.into()));
+            } else {
+                self.border
+                    .render(ctx.renderer, loc, &mut |elem| push(elem.into()));
+            }
         }
 
         // Hide the focus ring when maximized/fullscreened. It's not normally visible anyway due to
@@ -1343,8 +1465,13 @@ impl<W: LayoutElement> Tile<W> {
         // semitransparent bars in maximized state (which is a bit weird) and in the overview (also
         // a bit weird).
         if focus_ring && expanded_progress < 1. {
-            self.focus_ring
-                .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            if let Some(shared) = &shared {
+                self.focus_ring
+                    .render_shared(location, shared, &mut |elem| push(elem.into()));
+            } else {
+                self.focus_ring
+                    .render(ctx.renderer, location, &mut |elem| push(elem.into()));
+            }
         }
 
         if expanded_progress < 1. {
@@ -1361,8 +1488,18 @@ impl<W: LayoutElement> Tile<W> {
             surface_anim_scale,
             radius,
             xray_pos,
-            &mut |elem| push(elem.into()),
+            &mut |elem| {
+                let elem = if let Some(shared) = &shared {
+                    elem.with_shared(shared.clone())
+                } else {
+                    elem
+                };
+                push(elem.into());
+            },
         );
+        if let Some(shared) = &shared {
+            shared.finish();
+        }
     }
 
     pub fn render<R: NiriRenderer>(

@@ -1,7 +1,9 @@
 use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::gles::{GlesFrame, GlesRenderer, GlesTexture};
+use smithay::backend::renderer::multigpu::gbm::GbmGlesBackend;
+use smithay::backend::renderer::multigpu::MultiTexture;
 use smithay::backend::renderer::{
-    Bind, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, RendererSuper, Texture,
+    Bind, ContextId, ExportMem, ImportAll, ImportMem, Offscreen, Renderer, RendererSuper, Texture,
 };
 
 use crate::backend::tty::{TtyFrame, TtyRenderer};
@@ -17,7 +19,7 @@ pub trait NiriRenderer:
     + AsGlesRenderer
 {
     // Associated types to work around the instability of associated type bounds.
-    type NiriTextureId: Texture + Clone + Send + 'static;
+    type NiriTextureId: Texture + Clone + Send + AsGlesTexture + 'static;
     type NiriError: std::error::Error
         + Send
         + Sync
@@ -28,12 +30,29 @@ pub trait NiriRenderer:
 impl<R> NiriRenderer for R
 where
     R: ImportAll + ImportMem + ExportMem + Bind<Dmabuf> + Offscreen<GlesTexture> + AsGlesRenderer,
-    R::TextureId: Texture + Clone + Send + 'static,
+    R::TextureId: Texture + Clone + Send + AsGlesTexture + 'static,
     R::Error:
         std::error::Error + Send + Sync + From<<GlesRenderer as RendererSuper>::Error> + 'static,
 {
     type NiriTextureId = R::TextureId;
     type NiriError = R::Error;
+}
+
+/// Resolve the native texture after it has been imported and synchronized.
+pub trait AsGlesTexture {
+    fn as_gles_texture(&self, context: &ContextId<GlesTexture>) -> Option<GlesTexture>;
+}
+
+impl AsGlesTexture for GlesTexture {
+    fn as_gles_texture(&self, _context: &ContextId<GlesTexture>) -> Option<GlesTexture> {
+        Some(self.clone())
+    }
+}
+
+impl AsGlesTexture for MultiTexture {
+    fn as_gles_texture(&self, context: &ContextId<GlesTexture>) -> Option<GlesTexture> {
+        self.get::<GbmGlesBackend<GlesRenderer, smithay::utils::DeviceFd>>(context)
+    }
 }
 
 /// Trait for getting the underlying `GlesRenderer`.

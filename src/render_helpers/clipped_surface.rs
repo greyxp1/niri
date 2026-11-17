@@ -1,18 +1,23 @@
+use std::rc::Rc;
+
 use glam::{Mat3, Vec2};
 use niri_config::CornerRadius;
-use smithay::backend::renderer::buffer_y_inverted;
-use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::{
+    WaylandSurfaceRenderElement, WaylandSurfaceTexture,
+};
 use smithay::backend::renderer::element::{Element, Id, Kind, RenderElement, UnderlyingStorage};
 use smithay::backend::renderer::gles::{
     GlesError, GlesFrame, GlesRenderer, GlesTexProgram, Uniform,
 };
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{buffer_y_inverted, Frame as _};
 use smithay::utils::user_data::UserDataMap;
 use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, Transform};
 
 use super::damage::ExtraDamage;
-use super::renderer::{AsGlesFrame as _, NiriRenderer};
+use super::renderer::{AsGlesFrame as _, AsGlesTexture as _, NiriRenderer};
 use super::shaders::{mat3_uniform, Shaders};
+use super::shared_corner::SharedCorner;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 #[derive(Debug)]
@@ -22,6 +27,8 @@ pub struct ClippedSurfaceRenderElement<R: NiriRenderer> {
     corner_radius: CornerRadius,
     geometry: Rectangle<f64, Logical>,
     scale: f32,
+    shared: Option<Rc<SharedCorner>>,
+    deferred: bool,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -44,7 +51,58 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
             corner_radius,
             geometry,
             scale: scale.x as f32,
+            shared: None,
+            deferred: false,
         }
+    }
+
+    pub fn with_shared(mut self, shared: Rc<SharedCorner>) -> Self {
+        self.deferred = shared.note_surface(&self.inner, Scale::from(f64::from(self.scale)));
+        self.shared = Some(shared);
+        self
+    }
+
+    fn record(&self, frame: &mut GlesFrame<'_, '_>) -> Result<(), GlesError> {
+        let Some(shared) = &self.shared else {
+            return Ok(());
+        };
+        let (texture, color) = match self.inner.texture() {
+            WaylandSurfaceTexture::Texture(texture) => (
+                Some(
+                    texture
+                        .as_gles_texture(&frame.context_id())
+                        .ok_or(GlesError::UnknownPixelFormat)?,
+                ),
+                [0.; 4],
+            ),
+            WaylandSurfaceTexture::SolidColor(color) => (None, color.components()),
+        };
+        let scale = Scale::from(f64::from(self.scale));
+        shared.add_source(
+            frame,
+            texture,
+            color,
+            self.inner.geometry(scale).to_f64().to_logical(scale),
+            self.inner.src(),
+            self.inner.transform(),
+            self.inner.alpha(),
+            scale,
+        )
+    }
+
+    fn normalized_src(&self, src: Rectangle<f64, Buffer>) -> Rectangle<f64, Buffer> {
+        let view = self.inner.src();
+        let normalized = Rectangle::new(
+            (
+                (src.loc.x - view.loc.x) / view.size.w,
+                (src.loc.y - view.loc.y) / view.size.h,
+            )
+                .into(),
+            (src.size.w / view.size.w, src.size.h / view.size.h).into(),
+        );
+        self.inner
+            .transform()
+            .transform_rect_in(normalized, &(1., 1.).into())
     }
 
     fn compute_uniforms(&self) -> Vec<Uniform<'static>> {
@@ -124,7 +182,7 @@ impl<R: NiriRenderer> ClippedSurfaceRenderElement<R> {
         }
     }
 
-    fn rounded_corners(
+    pub fn rounded_corners(
         geo: Rectangle<f64, Logical>,
         corner_radius: CornerRadius,
     ) -> [Rectangle<f64, Logical>; 4] {
@@ -238,6 +296,31 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
+        if let Some(shared) = &self.shared {
+            let scale = Scale::from(f64::from(self.scale));
+            let damage = shared.background_damage(
+                self.inner.geometry(scale).to_f64().to_logical(scale),
+                self.normalized_src(src),
+                dst,
+                damage,
+            );
+            if !self.deferred && !damage.is_empty() {
+                RenderElement::<GlesRenderer>::draw(
+                    &self.inner,
+                    frame,
+                    src,
+                    dst,
+                    &damage,
+                    opaque_regions,
+                    cache,
+                )?;
+            }
+            self.record(frame)?;
+            if self.deferred {
+                shared.set_native_damage(dst, &damage);
+            }
+            return Ok(());
+        }
         frame.override_default_tex_program(self.program.clone(), self.compute_uniforms());
         RenderElement::<GlesRenderer>::draw(
             &self.inner,
@@ -249,6 +332,7 @@ impl RenderElement<GlesRenderer> for ClippedSurfaceRenderElement<GlesRenderer> {
             cache,
         )?;
         frame.clear_tex_program_override();
+        self.record(frame)?;
         Ok(())
     }
 
@@ -271,11 +355,33 @@ impl<'render> RenderElement<TtyRenderer<'render>>
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), TtyRendererError<'render>> {
+        if let Some(shared) = &self.shared {
+            let scale = Scale::from(f64::from(self.scale));
+            let damage = shared.background_damage(
+                self.inner.geometry(scale).to_f64().to_logical(scale),
+                self.normalized_src(src),
+                dst,
+                damage,
+            );
+            if self.deferred || damage.is_empty() {
+                if let WaylandSurfaceTexture::Texture(texture) = self.inner.texture() {
+                    frame.prepare_texture(texture)?;
+                }
+            } else {
+                RenderElement::draw(&self.inner, frame, src, dst, &damage, opaque_regions, cache)?;
+            }
+            self.record(frame.as_gles_frame())?;
+            if self.deferred {
+                shared.set_native_damage(dst, &damage);
+            }
+            return Ok(());
+        }
         frame
             .as_gles_frame()
             .override_default_tex_program(self.program.clone(), self.compute_uniforms());
         RenderElement::draw(&self.inner, frame, src, dst, damage, opaque_regions, cache)?;
         frame.as_gles_frame().clear_tex_program_override();
+        self.record(frame.as_gles_frame())?;
         Ok(())
     }
 

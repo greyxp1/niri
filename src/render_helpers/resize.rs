@@ -14,10 +14,15 @@ use smithay::utils::{Buffer, Logical, Physical, Rectangle, Scale, Size, Transfor
 use super::renderer::{AsGlesFrame, NiriRenderer};
 use super::shader_element::ShaderRenderElement;
 use super::shaders::{mat3_uniform, ProgramType, Shaders};
+use super::shared_corner::SharedCorner;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 
 #[derive(Debug)]
-pub struct ResizeRenderElement(ShaderRenderElement);
+pub struct ResizeRenderElement {
+    inner: ShaderRenderElement,
+    scale: Scale<f64>,
+    shared: Option<Rc<SharedCorner>>,
+}
 
 impl ResizeRenderElement {
     #[allow(clippy::too_many_arguments)]
@@ -68,6 +73,7 @@ impl ResizeRenderElement {
         let size_prev = Vec2::new(size_prev.w as f32, size_prev.h as f32);
         let size_next = Vec2::new(size_next.w as f32, size_next.h as f32);
 
+        let output_scale = scale;
         let scale = Vec2::new(scale.x as f32, scale.y as f32);
 
         // Compute the transformation matrices.
@@ -86,8 +92,8 @@ impl ResizeRenderElement {
         let clip_to_geometry = if clip_to_geometry { 1. } else { 0. };
 
         // Create the shader.
-        Self(
-            ShaderRenderElement::new(
+        Self {
+            inner: ShaderRenderElement::new(
                 ProgramType::Resize,
                 area.size,
                 None,
@@ -112,7 +118,23 @@ impl ResizeRenderElement {
                 Kind::Unspecified,
             )
             .with_location(area.loc),
-        )
+            scale: output_scale,
+            shared: None,
+        }
+    }
+
+    pub fn with_shared(mut self, shared: Rc<SharedCorner>) -> Self {
+        shared.note_surface(&self.inner, self.scale);
+        self.shared = Some(shared);
+        self
+    }
+
+    pub fn supports_shared(&self) -> bool {
+        ["niri_tex_prev", "niri_tex_next"].into_iter().all(|name| {
+            self.inner
+                .texture(name)
+                .is_some_and(|texture| !texture.is_external())
+        })
     }
 
     pub fn has_shader(renderer: &mut impl NiriRenderer) -> bool {
@@ -124,23 +146,23 @@ impl ResizeRenderElement {
 
 impl Element for ResizeRenderElement {
     fn id(&self) -> &Id {
-        self.0.id()
+        self.inner.id()
     }
 
     fn current_commit(&self) -> CommitCounter {
-        self.0.current_commit()
+        self.inner.current_commit()
     }
 
     fn geometry(&self, scale: Scale<f64>) -> Rectangle<i32, Physical> {
-        self.0.geometry(scale)
+        self.inner.geometry(scale)
     }
 
     fn transform(&self) -> Transform {
-        self.0.transform()
+        self.inner.transform()
     }
 
     fn src(&self) -> Rectangle<f64, Buffer> {
-        self.0.src()
+        self.inner.src()
     }
 
     fn damage_since(
@@ -148,19 +170,19 @@ impl Element for ResizeRenderElement {
         scale: Scale<f64>,
         commit: Option<CommitCounter>,
     ) -> DamageSet<i32, Physical> {
-        self.0.damage_since(scale, commit)
+        self.inner.damage_since(scale, commit)
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        self.0.opaque_regions(scale)
+        self.inner.opaque_regions(scale)
     }
 
     fn alpha(&self) -> f32 {
-        self.0.alpha()
+        self.inner.alpha()
     }
 
     fn kind(&self) -> Kind {
-        self.0.kind()
+        self.inner.kind()
     }
 }
 
@@ -174,10 +196,24 @@ impl RenderElement<GlesRenderer> for ResizeRenderElement {
         opaque_regions: &[Rectangle<i32, Physical>],
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
+        if let Some(shared) = &self.shared {
+            shared.add_resize(&self.inner, self.scale);
+            let interior_damage = shared.background_damage(
+                self.inner
+                    .geometry(self.scale)
+                    .to_f64()
+                    .to_logical(self.scale),
+                src,
+                dst,
+                damage,
+            );
+            shared.set_native_damage(dst, &interior_damage);
+            return Ok(());
+        }
         let _span = tracy_client::span!("ResizeRenderElement::draw");
         frame.with_gpu_span(gpu_span_location!("ResizeRenderElement::draw"), |frame| {
             RenderElement::<GlesRenderer>::draw(
-                &self.0,
+                &self.inner,
                 frame,
                 src,
                 dst,
@@ -189,7 +225,7 @@ impl RenderElement<GlesRenderer> for ResizeRenderElement {
     }
 
     fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<UnderlyingStorage<'_>> {
-        self.0.underlying_storage(renderer)
+        self.inner.underlying_storage(renderer)
     }
 }
 
@@ -212,6 +248,6 @@ impl<'render> RenderElement<TtyRenderer<'render>> for ResizeRenderElement {
         &self,
         renderer: &mut TtyRenderer<'render>,
     ) -> Option<UnderlyingStorage<'_>> {
-        self.0.underlying_storage(renderer)
+        self.inner.underlying_storage(renderer)
     }
 }

@@ -15,6 +15,7 @@ use smithay::utils::{Buffer, Logical, Physical, Point, Rectangle, Scale, Size, T
 use super::renderer::NiriRenderer;
 use super::shader_element::ShaderRenderElement;
 use super::shaders::{mat3_uniform, ProgramType, Shaders};
+use super::shared_corner::Decoration;
 use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 use crate::render_helpers::renderer::AsGlesFrame as _;
 
@@ -28,6 +29,7 @@ use crate::render_helpers::renderer::AsGlesFrame as _;
 pub struct BorderRenderElement {
     inner: ShaderRenderElement,
     params: Parameters,
+    shared: Option<Rc<super::shared_corner::SharedCorner>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -47,6 +49,65 @@ struct Parameters {
 }
 
 impl BorderRenderElement {
+    pub fn exclude_corners(&mut self, shared: &Rc<super::shared_corner::SharedCorner>) {
+        self.shared = Some(shared.clone());
+    }
+    pub fn decoration(
+        &self,
+        location: Point<f64, Logical>,
+        origin: Point<f64, Logical>,
+        background: bool,
+    ) -> Decoration {
+        let params = self.params;
+        let offset = params.geometry.loc - params.gradient_area.loc;
+        let direction = Vec2::from_angle(params.angle);
+        let mut diagonal = Vec2::new(
+            params.gradient_area.size.w as f32,
+            params.gradient_area.size.h as f32,
+        );
+        if (direction.x < 0. && 0. <= direction.y) || (0. <= direction.x && direction.y < 0.) {
+            diagonal.x = -diagonal.x;
+        }
+        let mut vector = diagonal.project_onto(direction);
+        if direction.y < 0. {
+            vector = -vector;
+        }
+        let location = location + params.geometry.loc - origin;
+        Decoration {
+            rect: [
+                location.x as f32,
+                location.y as f32,
+                params.geometry.size.w as f32,
+                params.geometry.size.h as f32,
+            ],
+            radius: params.corner_radius.into(),
+            color_from: params.color_from.to_array_unpremul(),
+            color_to: params.color_to.to_array_unpremul(),
+            grad: [
+                offset.x as f32,
+                offset.y as f32,
+                params.gradient_area.size.w as f32,
+                params.alpha,
+            ],
+            options: [
+                vector.x,
+                vector.y,
+                match params.gradient_format.color_space {
+                    GradientColorSpace::Srgb => 0.,
+                    GradientColorSpace::SrgbLinear => 1.,
+                    GradientColorSpace::Oklab => 2.,
+                    GradientColorSpace::Oklch => 3.,
+                },
+                match params.gradient_format.hue_interpolation {
+                    HueInterpolation::Shorter => 0.,
+                    HueInterpolation::Longer => 1.,
+                    HueInterpolation::Increasing => 2.,
+                    HueInterpolation::Decreasing => 3.,
+                },
+            ],
+            behavior: [if background { 1. } else { 0. }, 0., 0., 0.],
+        }
+    }
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         size: Size<f64, Logical>,
@@ -64,6 +125,7 @@ impl BorderRenderElement {
         let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
         let mut rv = Self {
             inner,
+            shared: None,
             params: Parameters {
                 size,
                 gradient_area,
@@ -86,6 +148,7 @@ impl BorderRenderElement {
         let inner = ShaderRenderElement::empty(ProgramType::Border, Kind::Unspecified);
         Self {
             inner,
+            shared: None,
             params: Parameters {
                 size: Default::default(),
                 gradient_area: Default::default(),
@@ -266,7 +329,21 @@ impl Element for BorderRenderElement {
     }
 
     fn opaque_regions(&self, scale: Scale<f64>) -> OpaqueRegions<i32, Physical> {
-        self.inner.opaque_regions(scale)
+        let regions = self.inner.opaque_regions(scale);
+        if let Some(shared) = &self.shared {
+            let geometry = self.geometry(scale);
+            shared
+                .background_damage(
+                    geometry.to_f64().to_logical(scale),
+                    self.src(),
+                    geometry,
+                    &regions,
+                )
+                .into_iter()
+                .collect()
+        } else {
+            regions
+        }
     }
 
     fn alpha(&self) -> f32 {
@@ -289,6 +366,22 @@ impl RenderElement<GlesRenderer> for BorderRenderElement {
         cache: Option<&UserDataMap>,
     ) -> Result<(), GlesError> {
         let _span = tracy_client::span!("BorderRenderElement::draw");
+        let clipped;
+        let damage = if let Some(shared) = &self.shared {
+            let scale = Scale::from(f64::from(self.params.scale));
+            clipped = shared.background_damage(
+                self.geometry(scale).to_f64().to_logical(scale),
+                src,
+                dst,
+                damage,
+            );
+            clipped.as_slice()
+        } else {
+            damage
+        };
+        if damage.is_empty() {
+            return Ok(());
+        }
         frame.with_gpu_span(gpu_span_location!("BorderRenderElement::draw"), |frame| {
             RenderElement::<GlesRenderer>::draw(
                 &self.inner,

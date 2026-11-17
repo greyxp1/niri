@@ -552,7 +552,6 @@ impl Thumbnail {
             config.width = round(BORDER);
             config.active_color = color;
             border.update_config(config);
-            border.set_thicken_corners(false);
             border.update_render_elements(
                 size,
                 true,

@@ -19,7 +19,6 @@ pub struct FocusRing {
     is_border: bool,
     use_border_shader: bool,
     config: niri_config::FocusRing,
-    thicken_corners: bool,
 }
 
 niri_render_elements! {
@@ -30,6 +29,39 @@ niri_render_elements! {
 }
 
 impl FocusRing {
+    pub fn draws_outline(&self) -> bool {
+        !self.is_off() && self.is_border && self.width() > 0.
+    }
+
+    pub fn decoration(
+        &self,
+        location: Point<f64, Logical>,
+        origin: Point<f64, Logical>,
+    ) -> Option<crate::render_helpers::shared_corner::Decoration> {
+        if self.is_off() || (self.is_border && self.width() == 0.) {
+            return None;
+        }
+        Some(self.borders[0].decoration(location + self.locations[0], origin, !self.is_border))
+    }
+
+    pub fn render_shared(
+        &self,
+        location: Point<f64, Logical>,
+        shared: &std::rc::Rc<crate::render_helpers::shared_corner::SharedCorner>,
+        push: &mut dyn FnMut(FocusRingRenderElement),
+    ) {
+        if self.is_off() {
+            return;
+        }
+        if !self.is_border {
+            // Keep the existing single background draw, excluding only regions
+            // resolved by the shared corner shader.
+            let mut border = self.borders[0].clone();
+            border.exclude_corners(shared);
+            push(border.with_location(location + self.locations[0]).into());
+        }
+    }
+
     pub fn new(config: niri_config::FocusRing) -> Self {
         Self {
             buffers: Default::default(),
@@ -40,7 +72,6 @@ impl FocusRing {
             is_border: false,
             use_border_shader: false,
             config,
-            thicken_corners: true,
         }
     }
 
@@ -103,14 +134,7 @@ impl FocusRing {
             GradientRelativeTo::WorkspaceView => view_rect,
         };
 
-        let rounded_corner_border_width = if is_border {
-            // HACK: increase the border width used for the inner rounded corners a tiny bit to
-            // reduce background bleed.
-            let extra = if self.thicken_corners { 0.5 } else { 0. };
-            width as f32 + extra
-        } else {
-            0.
-        };
+        let rounded_corner_border_width = if is_border { width as f32 } else { 0. };
 
         let ceil = |logical: f64| (logical * scale).ceil() / scale;
 
@@ -264,10 +288,6 @@ impl FocusRing {
 
     pub fn is_off(&self) -> bool {
         self.config.off
-    }
-
-    pub fn set_thicken_corners(&mut self, value: bool) {
-        self.thicken_corners = value;
     }
 
     pub fn config(&self) -> &niri_config::FocusRing {

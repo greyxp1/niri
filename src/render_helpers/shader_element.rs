@@ -22,6 +22,8 @@ use crate::backend::tty::{TtyFrame, TtyRenderer, TtyRendererError};
 #[derive(Debug, Clone)]
 pub struct ShaderRenderElement {
     program: ProgramType,
+    shader: Option<ShaderProgram>,
+    native_damage: usize,
     id: Id,
     commit_counter: CommitCounter,
     area: Rectangle<f64, Logical>,
@@ -69,13 +71,22 @@ unsafe fn compile_program(
     src: &str,
     additional_uniforms: &[UniformName<'_>],
     texture_uniforms: &[&str],
-    // destruction_callback_sender: Sender<CleanupResource>,
+    vertex_source: Option<&str>,
 ) -> Result<ShaderProgram, GlesError> {
+    let vertex = vertex_source
+        .map(|vertex| format!("#version 100\n{vertex}"))
+        .unwrap_or_else(|| include_str!("shaders/texture.vert").to_owned());
     let shader = format!("#version 100\n{src}");
-    let program = unsafe { link_program(gl, include_str!("shaders/texture.vert"), &shader)? };
-    let debug_shader = format!("#version 100\n#define DEBUG_FLAGS\n{src}");
-    let debug_program =
-        unsafe { link_program(gl, include_str!("shaders/texture.vert"), &debug_shader)? };
+    let program = unsafe { link_program(gl, &vertex, &shader)? };
+    let debug_shader = shader.replacen('\n', "\n#define DEBUG_FLAGS\n", 1);
+    let debug_vertex = vertex.replacen('\n', "\n#define DEBUG_FLAGS\n", 1);
+    let debug_program = match unsafe { link_program(gl, &debug_vertex, &debug_shader) } {
+        Ok(debug_program) => debug_program,
+        Err(err) => {
+            unsafe { gl.DeleteProgram(program) };
+            return Err(err);
+        }
+    };
 
     let vert = c"vert";
     let vert_position = c"vert_position";
@@ -165,7 +176,29 @@ impl ShaderProgram {
         texture_uniforms: &[&str],
     ) -> Result<Self, GlesError> {
         renderer.with_context(move |gl| unsafe {
-            compile_program(gl, src, additional_uniforms, texture_uniforms)
+            compile_program(gl, src, additional_uniforms, texture_uniforms, None)
+        })?
+    }
+
+    pub(crate) fn compile_with_vertex(
+        renderer: &mut GlesRenderer,
+        vertex: &str,
+        fragment: &str,
+        uniforms: &[UniformName<'_>],
+    ) -> Result<Self, GlesError> {
+        renderer.with_context(|gl| unsafe {
+            compile_program(gl, fragment, uniforms, &[], Some(vertex))
+        })?
+    }
+
+    pub(crate) fn compile_for_frame(
+        frame: &mut GlesFrame<'_, '_>,
+        vertex: &str,
+        fragment: &str,
+        uniforms: &[UniformName<'_>],
+    ) -> Result<Self, GlesError> {
+        frame.with_context(|gl| unsafe {
+            compile_program(gl, fragment, uniforms, &[], Some(vertex))
         })?
     }
 
@@ -192,6 +225,8 @@ impl ShaderRenderElement {
     ) -> Self {
         Self {
             program,
+            shader: None,
+            native_damage: 0,
             id: Id::new(),
             commit_counter: CommitCounter::default(),
             area: Rectangle::from_size(size),
@@ -207,6 +242,8 @@ impl ShaderRenderElement {
     pub fn empty(program: ProgramType, kind: Kind) -> Self {
         Self {
             program,
+            shader: None,
+            native_damage: 0,
             id: Id::new(),
             commit_counter: CommitCounter::default(),
             area: Rectangle::default(),
@@ -242,8 +279,34 @@ impl ShaderRenderElement {
         self.commit_counter.increment();
     }
 
+    pub(crate) fn uniforms(&self) -> Rc<[Uniform<'static>]> {
+        self.additional_uniforms.clone()
+    }
+
+    pub(crate) fn texture(&self, name: &str) -> Option<&GlesTexture> {
+        self.textures.get(name)
+    }
+
     pub fn with_location(mut self, location: Point<f64, Logical>) -> Self {
         self.area.loc = location;
+        self
+    }
+
+    pub fn with_program_and_uniforms(
+        mut self,
+        program: ProgramType,
+        uniforms: impl IntoIterator<Item = Uniform<'static>>,
+    ) -> Self {
+        self.program = program;
+        let mut merged = self.additional_uniforms.to_vec();
+        merged.extend(uniforms);
+        self.additional_uniforms = merged.into();
+        self
+    }
+
+    pub(crate) fn with_shader(mut self, shader: ShaderProgram, native_damage: usize) -> Self {
+        self.shader = Some(shader);
+        self.native_damage = native_damage;
         self
     }
 
@@ -300,7 +363,11 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
 
         let frame = frame.as_gles_frame();
 
-        let Some(shader) = Shaders::get_from_frame(frame).program(self.program) else {
+        let Some(shader) = self
+            .shader
+            .clone()
+            .or_else(|| Shaders::get_from_frame(frame).program(self.program))
+        else {
             return Ok(());
         };
 
@@ -314,48 +381,52 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
         // prepare the vertices
         resources.vertices.clear();
         if supports_instancing {
-            resources.vertices.extend(damage.iter().flat_map(|rect| {
-                let dest_size = dest.size;
+            resources
+                .vertices
+                .extend(damage.iter().enumerate().flat_map(|(index, rect)| {
+                    let dest_size = dest.size;
 
-                let rect_constrained_loc = rect
-                    .loc
-                    .constrain(Rectangle::from_extremities((0, 0), dest_size.to_point()));
-                let rect_clamped_size = rect.size.clamp(
-                    (0, 0),
-                    (dest_size.to_point() - rect_constrained_loc).to_size(),
-                );
+                    let rect_constrained_loc = rect
+                        .loc
+                        .constrain(Rectangle::from_extremities((0, 0), dest_size.to_point()));
+                    let rect_clamped_size = rect.size.clamp(
+                        (0, 0),
+                        (dest_size.to_point() - rect_constrained_loc).to_size(),
+                    );
 
-                let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
-                [
-                    rect.loc.x as f32,
-                    rect.loc.y as f32,
-                    rect.size.w as f32,
-                    rect.size.h as f32,
-                ]
-            }));
-        } else {
-            resources.vertices.extend(damage.iter().flat_map(|rect| {
-                let dest_size = dest.size;
-
-                let rect_constrained_loc = rect
-                    .loc
-                    .constrain(Rectangle::from_extremities((0, 0), dest_size.to_point()));
-                let rect_clamped_size = rect.size.clamp(
-                    (0, 0),
-                    (dest_size.to_point() - rect_constrained_loc).to_size(),
-                );
-
-                let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
-                // Add the 4 f32s per damage rectangle for each of the 6 vertices.
-                (0..6).flat_map(move |_| {
+                    let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
                     [
                         rect.loc.x as f32,
                         rect.loc.y as f32,
-                        rect.size.w as f32,
+                        rect.size.w as f32 * if index < self.native_damage { -1. } else { 1. },
                         rect.size.h as f32,
                     ]
-                })
-            }));
+                }));
+        } else {
+            resources
+                .vertices
+                .extend(damage.iter().enumerate().flat_map(|(index, rect)| {
+                    let dest_size = dest.size;
+
+                    let rect_constrained_loc = rect
+                        .loc
+                        .constrain(Rectangle::from_extremities((0, 0), dest_size.to_point()));
+                    let rect_clamped_size = rect.size.clamp(
+                        (0, 0),
+                        (dest_size.to_point() - rect_constrained_loc).to_size(),
+                    );
+
+                    let rect = Rectangle::new(rect_constrained_loc, rect_clamped_size);
+                    // Add the 4 f32s per damage rectangle for each of the 6 vertices.
+                    (0..6).flat_map(move |_| {
+                        [
+                            rect.loc.x as f32,
+                            rect.loc.y as f32,
+                            rect.size.w as f32 * if index < self.native_damage { -1. } else { 1. },
+                            rect.size.h as f32,
+                        ]
+                    })
+                }));
         }
 
         if resources.vertices.is_empty() {
@@ -438,7 +509,9 @@ impl RenderElement<GlesRenderer> for ShaderRenderElement {
                             .ok_or_else(|| {
                                 GlesError::UnknownUniform(uniform.name.clone().into_owned())
                             })?;
-                    uniform.value.set(gl, desc)?;
+                    if desc.location >= 0 {
+                        uniform.value.set(gl, desc)?;
+                    }
                 }
 
                 gl.EnableVertexAttribArray(program.attrib_vert as u32);
